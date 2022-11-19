@@ -54,8 +54,8 @@ extern unsigned int size_usbd_irx;
 extern unsigned char bdm_irx[] __attribute__((aligned(16)));
 extern unsigned int size_bdm_irx;
 
-extern unsigned char bdmfs_vfat_irx[] __attribute__((aligned(16)));
-extern unsigned int size_bdmfs_vfat_irx;
+extern unsigned char bdmfs_fatfs_irx[] __attribute__((aligned(16)));
+extern unsigned int size_bdmfs_fatfs_irx;
 
 extern unsigned char usbmass_bd_irx[] __attribute__((aligned(16)));
 extern unsigned int size_usbmass_bd_irx;
