@@ -66,7 +66,7 @@ EE_OBJS = frontend/frontend_salamander.o \
 # IRX libs
 IRX_FILES += sio2man.irx iomanX.irx fileXio.irx
 IRX_FILES += mcman.irx mcserv.irx
-IRX_FILES += usbd.irx bdm.irx bdmfs_vfat.irx usbmass_bd.irx
+IRX_FILES += usbd.irx bdm.irx bdmfs_fatfs.irx usbmass_bd.irx
 IRX_FILES += cdfs.irx
 IRX_FILES += ps2dev9.irx ps2atad.irx ps2hdd.irx ps2fs.irx poweroff.irx
 EE_OBJS += $(IRX_FILES:.irx=_irx.o)
