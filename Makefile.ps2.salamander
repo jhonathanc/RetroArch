@@ -80,6 +80,8 @@ EE_INCS = $(INCDIR)
 EE_BIN = $(TARGET)
 EE_GPVAL = $(GPVAL)
 
+BIN2S = $(PS2SDK)/bin/bin2s
+
 all: $(EE_BIN)
 
 clean:
@@ -94,6 +96,7 @@ release: all
 	ps2-packer $(EE_BIN) $(TARGET_RELEASE)
 
 # IRX files
+$(BIN2S) $< $@ bdmfs_fatfs_irx
 %_irx.c:
 	$(PS2SDK)/bin/bin2c $(PS2SDK)/iop/irx/$*.irx $@ $*_irx
 
