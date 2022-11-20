@@ -10,6 +10,7 @@ MUTE_WARNINGS      = 1
 WHOLE_ARCHIVE_LINK = 0
 HAVE_STATIC_DUMMY ?= 0
 PS2_IP = 192.168.1.10
+BIN2S = $(PS2SDK)/bin/bin2s
 
 ifeq ($(DEBUG), 1)
    OPTIMIZE_LV	:= -O0 -g
@@ -118,7 +119,6 @@ EE_INCS = $(INCDIR)
 EE_BIN = $(TARGET).elf
 EE_GPVAL = $(GPVAL)
 
-
 all: $(EE_BIN)
 
 clean:
@@ -140,6 +140,7 @@ release: all
 	ps2-packer $(EE_BIN) $(TARGET_RELEASE)
 
 # IRX files
+$(BIN2S) $< $@ bdmfs_fatfs_irx
 %_irx.c:
 	$(PS2SDK)/bin/bin2c $(PS2SDK)/iop/irx/$*.irx $@ $*_irx
 
