@@ -83,14 +83,12 @@ ifeq ($(strip $(PS2SDK)),)
 $(error "Please set PS2SDK in your environment. export PS2SDK=<path to>ps2sdk")
 endif
 
-BIN2S = $(PS2SDK)/bin/bin2s
-
 INCDIR = -I$(PS2DEV)/gsKit/include -I$(PS2SDK)/ports/include
 INCDIR += -Ips2/include -Ilibretro-common/include -Ideps -Ideps/stb -Ideps/7zip
 
 LDFLAGS += -L$(PS2DEV)/gsKit/lib -L$(PS2SDK)/ports/lib -L.
 # Lib cdvd is needed to get proper time
-LIBS += -lpatches -lgskit -ldmakit -laudsrv -lmtap -lpadx -lz -lcdvd -lelf-loader -lfileXio -lpoweroff
+LIBS += -lpatches -lgskit -ldmakit -laudsrv -lmtap -lpadx -lz -lcdvd -lelf-loader -lfileXio -lpoweroff  -lbdmfs_fatfs
 
 
 CFLAGS = $(OPTIMIZE_LV) $(DISABLE_WARNINGS) $(DEFINES) -DPS2 -ffast-math -fsingle-precision-constant
@@ -141,7 +139,6 @@ release: all
 	ps2-packer $(EE_BIN) $(TARGET_RELEASE)
 
 # IRX files
-$(BIN2S) $< $@ bdmfs_fatfs_irx
 %_irx.c:
 	$(PS2SDK)/bin/bin2c $(PS2SDK)/iop/irx/$*.irx $@ $*_irx
 
