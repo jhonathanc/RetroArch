@@ -10,7 +10,6 @@ MUTE_WARNINGS      = 1
 WHOLE_ARCHIVE_LINK = 0
 HAVE_STATIC_DUMMY ?= 0
 PS2_IP = 192.168.1.10
-BIN2S = $(PS2SDK)/bin/bin2s
 
 ifeq ($(DEBUG), 1)
    OPTIMIZE_LV	:= -O0 -g
@@ -83,6 +82,8 @@ endif
 ifeq ($(strip $(PS2SDK)),)
 $(error "Please set PS2SDK in your environment. export PS2SDK=<path to>ps2sdk")
 endif
+
+BIN2S = $(PS2SDK)/bin/bin2s
 
 INCDIR = -I$(PS2DEV)/gsKit/include -I$(PS2SDK)/ports/include
 INCDIR += -Ips2/include -Ilibretro-common/include -Ideps -Ideps/stb -Ideps/7zip
