@@ -88,7 +88,7 @@ INCDIR += -Ips2/include -Ilibretro-common/include -Ideps -Ideps/stb -Ideps/7zip
 
 LDFLAGS += -L$(PS2DEV)/gsKit/lib -L$(PS2SDK)/ports/lib -L.
 # Lib cdvd is needed to get proper time
-LIBS += -lpatches -lgskit -ldmakit -laudsrv -lmtap -lpadx -lz -lcdvd -lelf-loader -lfileXio -lpoweroff  -lbdmfs_fatfs
+LIBS += -lpatches -lgskit -ldmakit -laudsrv -lmtap -lpadx -lz -lcdvd -lelf-loader -lfileXio -lpoweroff
 
 
 CFLAGS = $(OPTIMIZE_LV) $(DISABLE_WARNINGS) $(DEFINES) -DPS2 -ffast-math -fsingle-precision-constant
