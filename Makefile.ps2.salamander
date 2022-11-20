@@ -79,8 +79,6 @@ EE_ASFLAGS = $(ASFLAGS)
 EE_INCS = $(INCDIR)
 EE_BIN = $(TARGET)
 EE_GPVAL = $(GPVAL)
-EE_ASM_DIR = asm/
-BIN2S = $(PS2SDK)/bin/bin2s
 
 all: $(EE_BIN)
 
@@ -97,10 +95,9 @@ release: all
 
 # IRX files
 %_irx.c:
-	$(EE_ASM_DIR)bdmfs_fatfs.s: $(PS2SDK)/iop/irx/bdmfs_fatfs.irx | $(EE_ASM_DIR)
-		$(BIN2S) $< $@ bdmfs_fatfs_irx
 	$(PS2SDK)/bin/bin2c $(PS2SDK)/iop/irx/$*.irx $@ $*_irx
 
 #Include preferences
+include $(PS2SDK)/iop/fs/bdmfs_fatfs/Makefile
 include $(PS2SDK)/samples/Makefile.pref
 include $(PS2SDK)/samples/Makefile.eeglobal_cpp
