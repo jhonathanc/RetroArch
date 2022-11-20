@@ -98,6 +98,5 @@ release: all
 	$(PS2SDK)/bin/bin2c $(PS2SDK)/iop/irx/$*.irx $@ $*_irx
 
 #Include preferences
-include $(PS2SDK)/iop/fs/bdmfs_fatfs/Makefile
 include $(PS2SDK)/samples/Makefile.pref
 include $(PS2SDK)/samples/Makefile.eeglobal_cpp
