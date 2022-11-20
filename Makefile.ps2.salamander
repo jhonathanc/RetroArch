@@ -28,7 +28,7 @@ RARCH_DEFINES += -DPS2 -DIS_SALAMANDER -DRARCH_CONSOLE
 
 LIBDIR =
 LDFLAGS =
-LIBS = -lelf-loader -lpatches -lfileXio -lpoweroff -lbdmfs_fatfs
+LIBS = -lelf-loader -lpatches -lfileXio -lpoweroff
 
 ifeq ($(SCREEN_DEBUG), 1)
 LIBS += -ldebug
