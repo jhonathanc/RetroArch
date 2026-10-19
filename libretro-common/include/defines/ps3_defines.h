@@ -234,13 +234,14 @@ extern int audioAddData(uint32_t portNum, float *data,
 #define KB_RMODE_INPUTCHAR CELL_KB_RMODE_INPUTCHAR
 #define KB_CODETYPE_RAW    CELL_KB_CODETYPE_RAW
 
-#define KbInfo cellKbInfo
+#define KbInfo CellKbInfo
 
 #define ioKbSetCodeType cellKbSetCodeType
 #define ioKbSetReadMode cellKbSetReadMode
 #define ioKbInit cellKbInit
 #define ioKbGetInfo cellKbGetInfo
-#define ioKbRead cellKbRead
+#define ioKbRead(port, data) cellKbRead(port, (CellKbData*)(data))
+#define ioKbEnd cellKbEnd
 
 /* Keyboard RAWDAT Key code (can't be converted to ASCII codes) */
 #define KB_RAWKEY_NO_EVENT			0x00
@@ -408,7 +409,7 @@ typedef struct KbData
 	KbLed led;					/*!< \brief Keyboard Led State */
 	KbMkey mkey;				/*!< \brief Keyboard Modifier Key State */
 	int32_t  nb_keycode;				/*!< \brief Number of key codes (0 equal no data) */
-	uint16_t keycode[MAX_KEYCODES];	/*!< \brief Keycode values */
+	uint16_t keycode[CELL_KB_MAX_KEYCODES];	/*!< \brief Keycode values */
 } KbData;
 #endif
 
@@ -931,6 +932,9 @@ typedef struct KbData
 #endif
 #ifndef sysFsStat
 #define sysFsStat cellFsStat
+#endif
+#ifndef sysFSStat
+#define sysFSStat CellFsStat
 #endif
 #ifndef sysFSDirent
 #define sysFSDirent CellFsDirent

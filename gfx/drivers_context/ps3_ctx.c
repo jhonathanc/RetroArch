@@ -108,7 +108,11 @@ static void gfx_ctx_ps3_get_video_size(void *data,
    {
       gfx_ctx_ps3_data_t *ps3 = (gfx_ctx_ps3_data_t*)data;
       if (ps3)
-         psglGetDeviceDimensions(ps3->gl_device, width, height);
+      {
+         unsigned width, height;
+         psglGetDeviceDimensions(ps3->gl_device, &width, &height);
+         *dims = VIDEO_SCALE_PACK(width, height);
+      }
    }
 #endif
 }
