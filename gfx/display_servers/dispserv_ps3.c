@@ -60,7 +60,11 @@ static unsigned ps3_display_server_system_id(void)
    ps3_video_state_t state;
    if (PS3_VIDEO_GET_STATE(&state) != 0)
       return PS3_MODE_ID_SYSTEM;
+#ifdef __PSL1GHT__
    return state.displayMode.resolution;
+#else
+   return state.displayMode.resolutionId;
+#endif
 }
 
 /* The mode the configured fullscreen size names, 0 for none */

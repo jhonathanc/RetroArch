@@ -45,7 +45,7 @@
 #ifdef __PSL1GHT__
 #include <io/kb.h>
 #else
-#include <ps3_defines.h>
+#include <defines/ps3_defines.h>
 #include <cell/keyboard.h>
 #endif
 #endif

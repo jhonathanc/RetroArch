@@ -512,7 +512,7 @@ void vfs_hybrid_init( retro_environment_t env_cb, retro_log_printf_t log ) {
 	filestream_set_mapped_ptr_cb( hyb_mapped_ptr );
 
 	if ( log )
-		log( RETRO_LOG_INFO,
+		(log)( RETRO_LOG_INFO,
 			"[vfs] hybrid: local-first with frontend v%u fallback%s\n",
 			hyb_front_version, HYB_SANDBOXED ? " (sandboxed platform: full fallback)" : " (URI paths only)" );
 }

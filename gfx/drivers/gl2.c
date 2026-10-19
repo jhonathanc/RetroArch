@@ -2145,6 +2145,7 @@ static void gl2_create_fbo_texture(gl2_t *gl,
       if (force_srgb_disable)
          srgb_fbo = false;
 
+#ifndef HAVE_PSGL
       if (      srgb_fbo
             && (chain->flags & GL2_CHAIN_FLAG_HAS_SRGB_FBO))
       {
@@ -2164,6 +2165,7 @@ static void gl2_create_fbo_texture(gl2_t *gl,
             GL_UNSIGNED_BYTE, NULL);
       }
       else
+#endif
       {
 #if defined(HAVE_OPENGLES)
          glTexImage2D(GL_TEXTURE_2D,
@@ -4252,6 +4254,7 @@ static void gl2_pbo_async_readback(gl2_t *gl)
    gl->pbo_readback_index = (gl->pbo_readback_index + 1) & 3;
 }
 
+#if !defined(HAVE_PSGL) && !defined(HAVE_OPENGLES1)
 /* GLSL 1.20 scRGB encode: mirror of the glcore / hdr_sm5 SDR branch
  * (gamma 2.4 linearize, expand-gamut matrix select, gamut round-trip,
  * paper-white / 80 scale). The matrices are the shared constants
@@ -4452,6 +4455,14 @@ static bool gl2_scrgb_init_program(gl2_t *gl)
    return true;
 }
 
+#else
+static bool gl2_scrgb_init_program(gl2_t *gl)
+{
+   (void)gl;
+   return false;
+}
+#endif
+
 #if !defined(HAVE_OPENGLES) && !defined(HAVE_PSGL)
 /* An RGBA16F texture is linear scRGB: 1.0 is 80 nits, the 709
  * primaries. Drawn into the UI's layer, which the encode (sdrToScrgb
@@ -4586,7 +4597,12 @@ static bool gl2_fp16_target_ok(void)
  * scRGB), and the driver reconciles here - same contract as glcore. */
 static bool gl2_needs_pq_downconvert(gl2_t *gl)
 {
+#if defined(HAVE_PSGL) || defined(HAVE_OPENGLES1)
+   (void)gl;
+   return false;
+#else
    return gl->video_info.source_hdr10 && !gl->scrgb.active;
+#endif
 }
 
 /* (Re)create the offscreen; returns the FBO the frame's final targets
@@ -4738,6 +4754,7 @@ static GLuint gl2_ui_target_fbo(gl2_t *gl)
  * a displayable SDR image in the ordinary way. */
 static void gl2_encode_pq_to_sdr(gl2_t *gl)
 {
+#if !defined(HAVE_PSGL) && !defined(HAVE_OPENGLES1)
    static const float quad_pos[8] = {
       0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f
    };
@@ -4796,6 +4813,9 @@ static void gl2_encode_pq_to_sdr(gl2_t *gl)
     * re-establishes on resize (see the matching restore in the
     * end-of-frame encode). */
    glViewport(VIDEO_POS_X(gl->vp.pos), VIDEO_POS_Y(gl->vp.pos), VIDEO_SCALE_W(gl->vp.dims), VIDEO_SCALE_H(gl->vp.dims));
+#else
+   (void)gl;
+#endif
 }
 
 /* Copies the backbuffer into the retained texture, sizing that texture
@@ -6970,6 +6990,7 @@ static bool gl2_frame(void *data, const void *frame,
     * encoded backbuffer. Menu HDR Brightness semantics match the
     * other five HDR paths: menu_nits when any UI is composited this
     * frame, paper white otherwise. */
+#if !defined(HAVE_PSGL) && !defined(HAVE_OPENGLES1)
    if (gl->scrgb.active && gl->scrgb.fbo && gl->scrgb.program)
    {
       float nits           = 200.0f;
@@ -7068,6 +7089,7 @@ static bool gl2_frame(void *data, const void *frame,
       glViewport(VIDEO_POS_X(gl->vp.pos), VIDEO_POS_Y(gl->vp.pos), VIDEO_SCALE_W(gl->vp.dims), VIDEO_SCALE_H(gl->vp.dims));
    }
 
+#endif
    /* Screenshots. */
    if (gl->readback_buffer_screenshot)
       gl2_renderchain_readback(gl,
@@ -7249,6 +7271,7 @@ static void gl2_destroy_resources(gl2_t *gl)
 
 static void gl2_scrgb_deinit(gl2_t *gl)
 {
+#if !defined(HAVE_PSGL) && !defined(HAVE_OPENGLES1)
    if (gl->scrgb.program)
    {
       glDeleteProgram(gl->scrgb.program);
@@ -7259,6 +7282,7 @@ static void gl2_scrgb_deinit(gl2_t *gl)
       glDeleteProgram(gl->scrgb.lin_program);
       gl->scrgb.lin_program = 0;
    }
+#endif
    gl->scrgb.lin_tried = false;
    gl->scrgb.tex_fp16  = false;
    gl->scrgb.fp16_made = false;

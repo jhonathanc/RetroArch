@@ -20,7 +20,7 @@
 #if !defined(__PSL1GHT__)
 #include <sysutil/sysutil_common.h>
 #endif
-#if defined (IS_SALAMANDER) && !defined(__PSL1GHT__)
+#if !defined(__PSL1GHT__)
 #include <netex/net.h>
 #include <np.h>
 #include <np/drm.h>

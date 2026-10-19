@@ -16,7 +16,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#ifdef __PSL1GHT__
 #include <malloc.h>
+#endif
 
 #include <retro_atomic.h>
 #include <retro_spsc.h>
@@ -201,7 +203,7 @@ static void *ps3_audio_init(const char *device,
 #ifdef __PSL1GHT__
    data,
 #else
-   (uint64_t)data,
+   (uint64_t)(uintptr_t)data,
 #endif
    1500, 0x1000, SYS_THREAD_CREATE_JOINABLE, (char*)"sound");
 

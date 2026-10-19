@@ -167,6 +167,9 @@
 #ifndef sysFsStat
 #define sysFsStat cellFsStat
 #endif
+#ifndef sysFSStat
+#define sysFSStat CellFsStat
+#endif
 #ifndef sysFSDirent
 #define sysFSDirent CellFsDirent
 #endif
