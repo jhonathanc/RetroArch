@@ -6303,6 +6303,47 @@ static void lane_entries(void)
             " them back\n");
 }
 
+/* A command asked for from another thread - the Vulkan context's
+ * restart for a refresh rate change, raised on the video thread - is
+ * carried out on the main thread, after the asking thread has gone
+ * on, and not on the thread that asked. */
+#ifdef HAVE_THREADS
+static void later_thread(void *data)
+{
+   (void)data;
+   command_event_later(CMD_EVENT_PAUSE, NULL);
+}
+#endif
+
+static void lane_command_later(void)
+{
+#ifdef HAVE_THREADS
+   unsigned had = failures;
+   sthread_t *t;
+
+   if (hf_paused())
+      command_event(CMD_EVENT_UNPAUSE, NULL);
+   CHECK(!hf_paused_now(), "command later: paused to begin with");
+   CHECK((t = sthread_create(later_thread, NULL)) != NULL,
+         "command later: no thread");
+   if (!t)
+      return;
+   sthread_join(t);
+   CHECK(!(runloop_get_flags() & RUNLOOP_FLAG_PAUSED),
+         "command later: done on the thread that asked");
+   run_loop_frames(3);
+   CHECK(hf_paused_now(), "command later: not done on the main thread");
+   command_event(CMD_EVENT_UNPAUSE, NULL);
+   run_loop_frames(2);
+   if (failures == had)
+      printf("[pass] command later: a command asked for from another"
+            " thread is carried out on the main thread, not on the one"
+            " that asked\n");
+#else
+   printf("[skip] command later: no threads\n");
+#endif
+}
+
 /* Macros: buttons of the RetroPad pressed for a user a step at a time
  * (input_macro_N in the configuration), started by an entry. Held to
  * what a macro says, by what the core is given frame by frame, read a
@@ -7901,57 +7942,34 @@ static void lane_sensor_snapshot_idle(void)
    input_driver_state_t *input_st = input_state_get_ptr();
    unsigned had                   = failures;
    float gyro[3], accel[3], rest[3];
-   int seq0, seq1, seq2, seq3, seq4;
+   unsigned n0, n1, n2, n3, n4;
 
    input_driver_set_shader_uses_sensors(false);
    run_loop_frames(3);
-   seq0 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
+   n0 = input_st->sensor_snap.published;
    run_loop_frames(20);
-   seq1 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
-   CHECK(seq1 == seq0,
+   n1 = input_st->sensor_snap.published;
+   CHECK(n1 == n0,
          "sensor snapshot: with no shader reading sensors the poll still publishes one");
 
    input_driver_set_shader_uses_sensors(true);
    run_loop_frames(10);
-   seq2 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
-   CHECK(seq2 >= seq1 + 2 * 10,
+   n2 = input_st->sensor_snap.published;
+   CHECK(n2 >= n1 + 10,
          "sensor snapshot: with a shader reading sensors it is not published every poll");
 
    input_driver_set_shader_uses_sensors(false);
    run_loop_frames(3);
-   seq3 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
+   n3 = input_st->sensor_snap.published;
    run_loop_frames(20);
-   seq4 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
-   CHECK(seq3 == seq2 + 2 && seq4 == seq3,
+   n4 = input_st->sensor_snap.published;
+   CHECK(n3 == n2 + 1 && n4 == n3,
          "sensor snapshot: after the shader went, noughts were not published once and then nothing");
    gyro[0] = accel[0] = 1.0f;
    input_driver_read_sensor_snapshot(gyro, accel, rest);
    CHECK(   gyro[0]  == 0.0f && gyro[1]  == 0.0f && gyro[2]  == 0.0f
          && accel[0] == 0.0f && accel[1] == 0.0f && accel[2] == 0.0f,
          "sensor snapshot: what is left published is not noughts");
-
-   /* Exercise the signed boundary and the full unsigned lap without
-    * waiting for months of sensor polls. */
-   {
-      unsigned edge;
-      for (edge = 0; edge < 2; edge++)
-      {
-         unsigned before = edge ? ~0u - 1u : (~0u >> 1) - 1u;
-         retro_atomic_store_relaxed_int(&input_st->sensor_snap_seq,
-               (int)before);
-         input_driver_set_shader_uses_sensors(true);
-         input_driver_poll();
-         CHECK((unsigned)retro_atomic_load_acquire_int(
-                  &input_st->sensor_snap_seq) == before + 2u,
-               "sensor snapshot: sequence did not wrap after one publication");
-         input_driver_set_shader_uses_sensors(false);
-         input_driver_poll();
-         input_driver_read_sensor_snapshot(gyro, accel, rest);
-         CHECK(   gyro[0] == 0.0f && gyro[1] == 0.0f && gyro[2] == 0.0f
-               && accel[0] == 0.0f && accel[1] == 0.0f && accel[2] == 0.0f,
-               "sensor snapshot: wrapped publication is not readable");
-      }
-   }
 
    if (failures == had)
       printf("[pass] sensor snapshot: published every poll while a shader"
@@ -8816,6 +8834,57 @@ static void lane_key_events(void)
             " keeps releases; two threads at once, no lock, each in order\n");
 }
 
+/* A key held when the input driver goes with a video restart is let
+ * go: the driver that would have said so is gone, and the core's
+ * keyboard callback and the menu would keep it held. */
+static unsigned keygone_down, keygone_up;
+
+static void keygone_core_cb(bool down, unsigned code, uint32_t character,
+      uint16_t mod)
+{
+   (void)character; (void)mod;
+   if (code != RETROK_F14)
+      return;
+   if (down)
+      keygone_down++;
+   else
+      keygone_up++;
+}
+
+static void lane_keys_let_go(void)
+{
+   runloop_state_t *runloop_st  = runloop_state_get_ptr();
+   retro_keyboard_event_t saved = runloop_st->key_event;
+   int flags                    = DRIVER_VIDEO_AND_INPUT_MASK;
+   unsigned had                 = failures;
+
+   runloop_st->key_event = keygone_core_cb;
+   keygone_down = keygone_up = 0;
+   input_keyboard_event(true, RETROK_F14, 0, 0, RETRO_DEVICE_KEYBOARD);
+   run_loop_frames(2);
+   CHECK(keygone_down == 1 && keygone_up == 0,
+         "keys let go: the press did not reach the core");
+
+   /* the input driver restarted with the video driver, not kept */
+   setenv("RETROARCH_INPUT_KEEP", "0", 1);
+   command_event(CMD_EVENT_REINIT, &flags);
+   unsetenv("RETROARCH_INPUT_KEEP");
+   run_loop_frames(3);
+   CHECK(keygone_up == 1,
+         "keys let go: a key held when the input driver went stayed held");
+
+   /* and once only: a later restart has nothing to let go */
+   command_event(CMD_EVENT_REINIT, &flags);
+   run_loop_frames(3);
+   CHECK(keygone_down == 1 && keygone_up == 1,
+         "keys let go: a key was let go twice, or pressed again");
+
+   runloop_st->key_event = saved;
+   if (failures == had)
+      printf("[pass] keys let go: a key held when the input driver goes"
+            " with a video restart reaches the core as let go, once\n");
+}
+
 /* ---- a joypad driver restart asked for from another thread --------- */
 
 /* On Windows a controller plugged in or pulled reaches the frontend
@@ -9159,6 +9228,8 @@ int main(int argc, char *argv[])
       lane_bind_names();
       lane_binds_shared_rows();
       lane_entries();
+      lane_keys_let_go();
+      lane_command_later();
       lane_macros();
       lane_macro_modes();
       lane_entries_kept();

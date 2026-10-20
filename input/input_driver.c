@@ -9744,6 +9744,8 @@ bool input_driver_take_kept(input_driver_t **input, void **input_data)
 
 /* Nothing took the kept driver back: it and the joypad drivers go, as
  * they would have with the video driver. */
+static void input_keys_let_go(void);
+
 void input_driver_drop_kept(void)
 {
    input_driver_state_t *input_st = &input_driver_st;
@@ -9768,6 +9770,7 @@ void input_driver_drop_kept(void)
    }
    if (input_st->current_data == data)
       input_st->current_data = NULL;
+   input_keys_let_go();
 }
 
 /* The video driver is going away. Unless the input driver's data is
@@ -9778,8 +9781,12 @@ void input_driver_free_with_video(const void *video_data)
 {
    input_driver_state_t *input_st = &input_driver_st;
 
+   /* the video driver frees it with its own */
    if (input_st->current_data == video_data)
+   {
+      input_keys_let_go();
       return;
+   }
 
    /* The driver goes, or is kept across the restart: whoever had the
     * keyboard has it no longer, as it always was here. Game Focus takes
@@ -9804,6 +9811,7 @@ void input_driver_free_with_video(const void *video_data)
    }
    input_keyboard_capture_release(INPUT_KEYBOARD_CAPTURE_ALL);
    input_st->current_data = NULL;
+   input_keys_let_go();
 }
 
 void input_pointer_capture_apply(bool force)
@@ -13781,31 +13789,12 @@ void input_driver_set_shader_uses_sensors(bool uses)
          &input_driver_st.shader_uses_sensors, uses ? 1 : 0);
 }
 
+/* The newest the poll has published. Never waits. One reader. */
 void input_driver_read_sensor_snapshot(float *gyro3,
       float *accel3, float *rest3)
 {
-   input_driver_state_t *input_st = &input_driver_st;
-   for (;;)
-   {
-      int v[9];
-      int i;
-      float *dst[3];
-      int s1 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
-      if (s1 & 1)
-         continue;
-      for (i = 0; i < 9; i++)
-         v[i] = retro_atomic_load_relaxed_int(
-               &input_st->sensor_snap_bits[i]);
-      retro_atomic_thread_fence_acquire();
-      if (retro_atomic_load_relaxed_int(&input_st->sensor_snap_seq) != s1)
-         continue;
-      dst[0] = gyro3;
-      dst[1] = accel3;
-      dst[2] = rest3;
-      for (i = 0; i < 9; i++)
-         memcpy(&dst[i / 3][i % 3], &v[i], sizeof(float));
-      return;
-   }
+   input_sensor_snap_take(&input_driver_st.sensor_snap,
+         gyro3, accel3, rest3);
 }
 
 #ifdef HAVE_THREADS
@@ -15211,6 +15200,17 @@ static bool input_remap_user_has_work(const settings_t *settings,
    return false;
 }
 
+/* Hardcore mode forbids input from a command: what was held before it
+ * began is not applied, and is let go at the next poll. */
+static INLINE bool input_cmd_forbidden(void)
+{
+#ifdef HAVE_CHEEVOS
+   return rcheevos_hardcore_active();
+#else
+   return false;
+#endif
+}
+
 void input_driver_poll(void)
 {
    size_t i, j;
@@ -15237,6 +15237,9 @@ void input_driver_poll(void)
       joypad                      = input_st->primary_joypad;
    }
 #endif
+
+   if (input_st->cmd_input && input_cmd_forbidden())
+      input_driver_command_release(MAX_USERS);
 
 #ifdef HAVE_HID
    /* the source beside the joypad driver first: what it finds decides
@@ -15354,32 +15357,12 @@ void input_driver_poll(void)
          }
          input_st->sensor_snap_quiet = !shader_uses;
 
-         /* Publish the three vec3s as one coherent snapshot: the shader
-          * backends read them from the video thread per frame, and plain
-          * float stores could hand them a vector mixing two polls (and
-          * carried no happens-before at all). Same seq discipline as the
-          * video viewport snapshots. */
-         {
-            unsigned seq = (unsigned)retro_atomic_load_relaxed_int(
-                  &input_st->sensor_snap_seq);
-            float *src[3];
-            int i, j;
-            src[0] = input_st->sensor_gyroscope_cache;
-            src[1] = input_st->sensor_accelerometer_cache;
-            src[2] = input_st->sensor_accelerometer_rest;
-            retro_atomic_store_relaxed_int(&input_st->sensor_snap_seq, (int)(seq + 1u));
-            retro_atomic_thread_fence_release();
-            for (i = 0; i < 3; i++)
-               for (j = 0; j < 3; j++)
-               {
-                  int b;
-                  memcpy(&b, &src[i][j], sizeof(b));
-                  retro_atomic_store_relaxed_int(
-                        &input_st->sensor_snap_bits[i * 3 + j], b);
-               }
-            retro_atomic_thread_fence_release();
-            retro_atomic_store_release_int(&input_st->sensor_snap_seq, (int)(seq + 2u));
-         }
+         /* Published as one snapshot for the shader backends' reads
+          * on the video thread (input_driver_read_sensor_snapshot()) */
+         input_sensor_snap_publish(&input_st->sensor_snap,
+               input_st->sensor_gyroscope_cache,
+               input_st->sensor_accelerometer_cache,
+               input_st->sensor_accelerometer_rest);
       }
    }
 
@@ -16379,7 +16362,7 @@ int16_t input_driver_state_wrapper(unsigned port, unsigned device,
       }
    }
 
-   if (input_st->cmd_input)
+   if (input_st->cmd_input && !input_cmd_forbidden())
       result = input_cmd_state(input_st, port, device, idx, id, result);
 
    /* Register any analog stick input requests for
@@ -17327,6 +17310,13 @@ static void input_keyboard_event_now(bool down, unsigned code,
 #ifdef HAVE_THREADS
 static input_key_lane_t input_key_lane;
 static bool input_key_lane_warned;
+#else
+/* the keys given out down, as the lane keeps them with threads */
+#define INPUT_KEY_LANE_WORDS ((RETROK_LAST + 31) / 32)
+static uint32_t input_keys_down[INPUT_KEY_LANE_WORDS];
+#endif
+
+#ifdef HAVE_THREADS
 
 /* The poll's: the events that came since the last one, then the kept
  * releases whose presses have been given out. */
@@ -17377,8 +17367,35 @@ static void input_keyboard_event_now(bool down, unsigned code,
 {
 #ifdef HAVE_THREADS
    input_key_lane_note(&input_key_lane, down, code, false);
+#else
+   if (code < RETROK_LAST)
+   {
+      if (down)
+         input_keys_down[code >> 5] |=  (1u << (code & 31));
+      else
+         input_keys_down[code >> 5] &= ~(1u << (code & 31));
+   }
 #endif
    input_keyboard_event_now_act(down, code, character, mod, device);
+}
+
+/* The input driver has gone, and with it the releases of the keys it
+ * gave out down: the core's keyboard callback and the menu are given
+ * them here, after what was still on its way. */
+static void input_keys_let_go(void)
+{
+   unsigned w, b;
+#ifdef HAVE_THREADS
+   uint32_t *down = input_key_lane.keys_down;
+   input_key_lane_poll();
+#else
+   uint32_t *down = input_keys_down;
+#endif
+   for (w = 0; w < INPUT_KEY_LANE_WORDS; w++)
+      for (b = 0; down[w] && b < 32; b++)
+         if (down[w] & (1u << b))
+            input_keyboard_event_now(false, w * 32 + b, 0, 0,
+                  RETRO_DEVICE_KEYBOARD);
 }
 
 static void input_keyboard_event_now_act(bool down, unsigned code,

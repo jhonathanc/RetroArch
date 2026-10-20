@@ -132,6 +132,7 @@ typedef struct
    int64_t      webm_seek_slot;
    int          webm_step;
    int          webm_restore_clock;
+   int          webm_cpu_resume;
    video_hw_frame_t hw_frame;
    int          hw_video;
    int64_t      hw_restart_ns;
@@ -217,6 +218,7 @@ typedef struct
    int64_t      dur_ns;              /* stream duration, 0 if unknown   */
    unsigned     last_input;          /* previous frame's buttons        */
    int          seeking;             /* suppress presentation           */
+   rwebm_video_hdr_tone_t tone;
    int          pix10;               /* frontend accepted XRGB2101010   */
 } media_player_t;
 
@@ -247,6 +249,26 @@ bool media_set_video_hw_refresh(media_hw_refresh_t cb, void *user)
    return true;
 }
 
+#ifdef MEDIA_HAVE_AUDIO
+/* A current packet prefix is not an audio end. MP4 knows the eventual
+ * packet count, so a short audio track can still finish before the file. */
+static bool media_audio_may_grow(media_player_t *p)
+{
+   if (!p->dt || data_transfer_complete(p->dt)
+         || data_transfer_failed(p->dt) || data_transfer_capped(p->dt))
+      return false;
+#ifdef HAVE_RMP4
+   if (p->agather)
+   {
+      uint32_t count = 0;
+      rmp4_track_pts(p->agather, p->agtrack, &count);
+      return p->anpkts < count;
+   }
+#endif
+   return true;
+}
+#endif
+
 static void media_drop_hw(media_player_t *p)
 {
    if (p->hw_frame.image)
@@ -260,12 +282,14 @@ static void media_close_webm_hw(media_player_t *p)
    if (p->webmvs)
       rwebm_video_stream_close(p->webmvs);
    p->webmvs = NULL;
+   p->webm_cpu_resume = 0;
    p->hw_video = 0;
 }
 
 static void media_rewind_webm_hw(media_player_t *p)
 {
    media_drop_hw(p);
+   p->webm_cpu_resume = 0;
    if (p->webmvs)
    {
       rwebm_video_stream_rewind(p->webmvs);
@@ -553,22 +577,28 @@ static int media_present_vp9(media_player_t *p, int show)
    if (p->vp9->hd.bit_depth == 10)
    {
       const rwebm_track *ct = rwebm_get_track(p->webm, p->vtrack);
+      unsigned peak = video_color_tonemap_peak_nits(
+            ct ? ct->transfer_characteristics : 0,
+            ct ? ct->max_cll : 0, ct ? &ct->mastering : NULL);
+      if (ct && ct->transfer_characteristics == 16
+            && (!p->tone.ready || p->tone.peak != peak))
+         rwebm_video_hdr_tone_init(&p->tone, peak);
       if (p->pix10)
-         rwebm_video_blit_i420_10bit(p->fb, p->width, w, h,
+         rwebm_video_blit_i420_10bit_tone(p->fb, p->width, w, h,
             (const uint16_t*)fb->y, p->vp9->ys,
             (const uint16_t*)fb->u, (const uint16_t*)fb->v, p->vp9->uvs,
             ct ? ct->matrix_coefficients : 0,
             ct ? ct->transfer_characteristics : 0,
             ct ? ct->colour_range : 0,
-            ct ? ct->max_cll : 0);
+            peak, ct ? ct->primaries : 0, &p->tone);
       else
-         rwebm_video_blit_i420_hbd(p->fb, p->width, w, h,
+         rwebm_video_blit_i420_hbd_tone(p->fb, p->width, w, h,
             (const uint16_t*)fb->y, p->vp9->ys,
             (const uint16_t*)fb->u, (const uint16_t*)fb->v, p->vp9->uvs,
             ct ? ct->matrix_coefficients : 0,
             ct ? ct->transfer_characteristics : 0,
             ct ? ct->colour_range : 0,
-            ct ? ct->max_cll : 0, 0);
+            peak, ct ? ct->primaries : 0, 0, &p->tone);
    }
    else
       {
@@ -856,17 +886,24 @@ void MEDIA_CORE_PREFIX(retro_get_system_info)(
 #endif
 }
 
+static unsigned media_audio_rate(const media_player_t *p)
+{
+#ifdef MEDIA_HAVE_AUDIO
+   if (p->actx)
+      return p->arate;
+#else
+   (void)p;
+#endif
+   return MEDIA_AUDIO_RATE;
+}
+
 void MEDIA_CORE_PREFIX(retro_get_system_av_info)(
       struct retro_system_av_info *info)
 {
    media_player_t *p = &media_player;
    memset(info, 0, sizeof(*info));
    info->timing.fps            = p->fps;
-   info->timing.sample_rate    = MEDIA_AUDIO_RATE;
-#ifdef MEDIA_HAVE_AUDIO
-   if (media_player.actx)
-      info->timing.sample_rate = (double)media_player.arate;
-#endif
+   info->timing.sample_rate    = (double)media_audio_rate(p);
    info->geometry.base_width   = p->width;
    info->geometry.base_height  = p->height;
    info->geometry.max_width    = p->width;
@@ -1022,8 +1059,8 @@ static bool media_seek_audio(media_player_t *p, int64_t want)
  * slot itself and target_ns only clamps (save-state restore, where
  * the slot is exact but the pts clock may run ahead of it under
  * display reordering). */
-static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
-      int64_t to_slot)
+static int64_t media_seek_internal_resume(media_player_t *p, int64_t target_ns,
+      int64_t to_slot, int resume)
 {
    p->webm_restore_clock = 0;
    if (target_ns < 0)
@@ -1170,7 +1207,7 @@ static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
       p->eof = 0;
       {
          int shown = kf_idx;
-         p->seeking = shown < tidx;
+         p->seeking = resume || shown < tidx;
          while (rwebm_read_packet(p->webm, &pkt) == 1)
          {
             int r;
@@ -1181,13 +1218,13 @@ static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
                break;
             if (r > 0)
             {
-               if (!p->seeking)
+               if (shown >= tidx)
                {
                   shown = tidx + 1;   /* target slot presented */
                   break;
                }
                shown++;
-               p->seeking = shown < tidx;
+               p->seeking = resume || shown < tidx;
             }
          }
 #ifdef MEDIA_HAVE_H264
@@ -1208,14 +1245,17 @@ static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
        * the display position under reordering); the wall clock sits a
        * frame past it - where the run loop would be at this point in
        * linear playback */
-      p->vpts_ns = p->vts && tidx < p->nvts ? p->vts[tidx] : target_ns;
-      p->play_ns = p->vpts_ns + p->frame_ns;
+      if (!resume)
+      {
+         p->vpts_ns = p->vts && tidx < p->nvts ? p->vts[tidx] : target_ns;
+         p->play_ns = p->vpts_ns + p->frame_ns;
+      }
       p->vshown  = (int64_t)tidx + 1;
    }
 
 seek_audio:
 #ifdef MEDIA_HAVE_AUDIO
-   if (p->actx)
+   if (!resume && p->actx)
    {
       int64_t want = (int64_t)((double)p->vpts_ns * 1e-9
             * (double)p->arate);
@@ -1223,6 +1263,12 @@ seek_audio:
    }
 #endif
    return p->vpts_ns;
+}
+
+static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
+      int64_t to_slot)
+{
+   return media_seek_internal_resume(p, target_ns, to_slot, 0);
 }
 
 /* Edge-triggered transport controls: left/right seek 10 seconds,
@@ -1334,6 +1380,8 @@ void media_video_hw_ready(void)
          if (p->webmvs && rwebm_video_stream_set_hw(p->webmvs, 1))
          {
             p->hw_video = 1;
+            p->webm_cpu_resume = p->hw_restart && p->fb
+                  && !p->webm_hw_required && !p->webm_restore_clock;
             p->webm_hw_shown = 0;
             p->webm_seek_slot = -1;
             p->webm_step = 0;
@@ -1347,10 +1395,18 @@ void media_video_hw_ready(void)
          p->hw_restart = 0;
          if (p->webm_restore_clock && p->webmvs)
             p->webm_seek_slot = restart_slot;
-         else if (media_seek_internal(p, target,
-                  p->webm_hw_required ? restart_slot : -1)
-               + 500000000 < target)
-            p->pending_seek_ns = target;
+         /* Backend replacement preserves the display ordinal, wall clock
+          * and PCM position. A fresh GPU stream catches up silently in
+          * media_run_webm_hw; CPU replay rebuilds references without
+          * presenting a seek picture or rewinding audio. */
+         else if (!p->webmvs)
+         {
+            if (!p->vshown)
+               rwebm_rewind(p->webm);
+            else if (media_seek_internal_resume(p, target,
+                     p->vshown - 1, 1) + 500000000 < target)
+               p->pending_seek_ns = target;
+         }
       }
    }
 #ifdef HAVE_RMP4
@@ -1415,6 +1471,113 @@ void media_video_hw_ready(void)
 #endif
 }
 
+static void media_run_webm_cpu(media_player_t *p, int advance_clock)
+{
+   rwebm_packet pkt;
+   if (!media_make_framebuffer(p))
+   {
+      p->eof = 1;
+      MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
+      MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+      return;
+   }
+
+   if (!p->eof)
+   {
+      int presented = 0, shown_now = 0;
+      int64_t target_slot = p->vshown - 1;
+      /* Pacing: one frame interval of wall time per run; the last
+       * display slot whose timestamp (with half a frame of tolerance
+       * for container rounding) falls inside it is the one to show.
+       * Constant-rate files advance exactly one slot per run;
+       * variable-rate files repeat the current picture through slow
+       * stretches and drop intermediates through fast ones. */
+      if (advance_clock)
+         p->play_ns += p->frame_ns;
+      while (target_slot + 1 < p->nvts
+            && p->vts[target_slot + 1] + p->frame_ns / 2 <= p->play_ns)
+         target_slot++;
+      while (p->vshown <= target_slot)
+      {
+         int r = rwebm_read_packet(p->webm, &pkt);
+         if (r == 2 && p->dt && !data_transfer_complete(p->dt)
+               && !data_transfer_failed(p->dt))
+            /* the next block has not arrived: hold the picture; the
+             * catch-up next run passes through what it missed */
+            break;
+         if (r != 1)
+         {
+#ifdef MEDIA_HAVE_H264
+            /* out of packets: hand out the pictures display reordering
+             * left queued before ending the stream */
+            if (p->codec == RWEBM_CODEC_H264)
+            {
+               p->seeking = p->vshown < target_slot;
+               if (media_drain_h264(p))
+               {
+                  if (!p->seeking)
+                     shown_now = 1;
+                  presented = 1;
+                  p->vshown++;
+                  continue;
+               }
+               p->seeking = 0;
+            }
+#endif
+            p->eof = 1;
+            break;
+         }
+         if (pkt.track != p->vtrack)
+            continue;
+         /* dropped intermediates skip colour conversion, like the
+          * seek catch-up */
+         p->seeking = p->vshown < target_slot;
+         presented = media_decode_packet(p, &pkt);
+         if (presented < 0)
+         {
+            p->seeking = 0;
+            p->eof = 1;
+            break;
+         }
+         /* With H.264 display reordering the decoded packet's
+          * timestamp can lag the displayed picture's; keep the clock
+          * monotonic. */
+         if (presented > 0)
+         {
+            if (!p->seeking)
+               shown_now = 1;
+            p->vshown++;
+            if (pkt.timestamp > p->vpts_ns)
+               p->vpts_ns = pkt.timestamp;
+         }
+      }
+      p->seeking = 0;
+      if (!shown_now)   /* nothing due this run: hold the picture */
+         MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
+            p->width * sizeof(uint32_t));
+      /* every display slot shown and a further interval elapsed: the
+       * stream is over (the packet reader no longer runs each frame,
+       * so it cannot notice on its own) */
+      if (p->nvts > 0 && p->vshown >= p->nvts && !shown_now
+            && (!p->dt || data_transfer_complete(p->dt)
+               || data_transfer_failed(p->dt)))
+         p->eof = 1;
+   }
+   else
+   {
+      int audio_done = 1;
+#ifdef MEDIA_HAVE_AUDIO
+      if (p->actx && !p->aeof)
+         audio_done = 0;
+#endif
+      MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
+         p->width * sizeof(uint32_t));
+      if (audio_done)
+         MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+   }
+
+}
+
 static void media_run_webm_hw(media_player_t *p)
 {
    int64_t started = cpu_features_get_time_usec();
@@ -1467,6 +1630,7 @@ static void media_run_webm_hw(media_player_t *p)
          media_drop_hw(p);
       else if (!skipped)
       {
+         p->webm_cpu_resume = 0;
          p->vshown = p->webm_hw_shown;
          p->vpts_ns = p->vts && p->vshown <= p->nvts
                ? p->vts[p->vshown - 1] : p->vpts_ns;
@@ -1475,7 +1639,16 @@ static void media_run_webm_hw(media_player_t *p)
       if (cpu_features_get_time_usec() - started >= 4000)
          break;
    }
-   media_present_hw(p);
+   /* A replacement renderer has no cached imported picture yet. Keep the
+    * last CPU image visible while the new decoder rebuilds references. */
+   if (!p->hw_frame.image && p->webm_cpu_resume
+         && p->webm_hw_shown <= target)
+      media_run_webm_cpu(p, 0);
+   else if (!p->hw_frame.image && p->fb && p->webm_hw_shown <= target)
+      MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
+            p->width * sizeof(uint32_t));
+   else
+      media_present_hw(p);
    if (!p->hw_frame.image && p->nvts > 0 && p->webm_hw_shown >= p->nvts
          && (!p->dt || data_transfer_complete(p->dt) || data_transfer_failed(p->dt)))
       p->eof = 1;
@@ -1494,7 +1667,6 @@ static void media_run_webm_hw(media_player_t *p)
 void MEDIA_CORE_PREFIX(retro_run)(void)
 {
    media_player_t *p = &media_player;
-   rwebm_packet pkt;
 
 #ifdef RARCH_INTERNAL
    libretro_media_video_hw_ready();
@@ -1562,7 +1734,12 @@ void MEDIA_CORE_PREFIX(retro_run)(void)
 
       if (p->hw_restart)
       {
-         MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
+         /* Decoder catch-up may span runs. Keep wall time moving so the
+          * next ready picture catches up with audio, and supply the last
+          * CPU picture if the replacement renderer has no cached frame. */
+         p->play_ns += p->frame_ns;
+         MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
+               p->fb ? p->width * sizeof(uint32_t) : 0);
          goto audio;
       }
 
@@ -1586,8 +1763,8 @@ void MEDIA_CORE_PREFIX(retro_run)(void)
       /* Bounded-memory streaming: release the pages behind what the
        * video stream has fully consumed (audio packets are copied
        * into the pump's blob as they arrive, so the gather region
-       * needs no residency of its own).  The metadata floor - sample
-       * tables, codec private data - always stays. */
+       * needs no residency of its own). The demuxer owns its sample
+       * tables and decoder setup independently of these file pages. */
       if (p->dt && p->pending_seek_ns < 0)
       {
          size_t mfloor  = rmp4_video_stream_media_floor(p->mp4vs);
@@ -1714,106 +1891,7 @@ void MEDIA_CORE_PREFIX(retro_run)(void)
       goto audio;
    }
 
-   if (!media_make_framebuffer(p))
-   {
-      p->eof = 1;
-      MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
-      MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-      return;
-   }
-
-   if (!p->eof)
-   {
-      int presented = 0, shown_now = 0;
-      int64_t target_slot = p->vshown - 1;
-      /* Pacing: one frame interval of wall time per run; the last
-       * display slot whose timestamp (with half a frame of tolerance
-       * for container rounding) falls inside it is the one to show.
-       * Constant-rate files advance exactly one slot per run;
-       * variable-rate files repeat the current picture through slow
-       * stretches and drop intermediates through fast ones. */
-      p->play_ns += p->frame_ns;
-      while (target_slot + 1 < p->nvts
-            && p->vts[target_slot + 1] + p->frame_ns / 2 <= p->play_ns)
-         target_slot++;
-      while (p->vshown <= target_slot)
-      {
-         int r = rwebm_read_packet(p->webm, &pkt);
-         if (r == 2 && p->dt && !data_transfer_complete(p->dt)
-               && !data_transfer_failed(p->dt))
-            /* the next block has not arrived: hold the picture; the
-             * catch-up next run passes through what it missed */
-            break;
-         if (r != 1)
-         {
-#ifdef MEDIA_HAVE_H264
-            /* out of packets: hand out the pictures display reordering
-             * left queued before ending the stream */
-            if (p->codec == RWEBM_CODEC_H264)
-            {
-               p->seeking = p->vshown < target_slot;
-               if (media_drain_h264(p))
-               {
-                  if (!p->seeking)
-                     shown_now = 1;
-                  presented = 1;
-                  p->vshown++;
-                  continue;
-               }
-               p->seeking = 0;
-            }
-#endif
-            p->eof = 1;
-            break;
-         }
-         if (pkt.track != p->vtrack)
-            continue;
-         /* dropped intermediates skip colour conversion, like the
-          * seek catch-up */
-         p->seeking = p->vshown < target_slot;
-         presented = media_decode_packet(p, &pkt);
-         if (presented < 0)
-         {
-            p->seeking = 0;
-            p->eof = 1;
-            break;
-         }
-         /* With H.264 display reordering the decoded packet's
-          * timestamp can lag the displayed picture's; keep the clock
-          * monotonic. */
-         if (presented > 0)
-         {
-            if (!p->seeking)
-               shown_now = 1;
-            p->vshown++;
-            if (pkt.timestamp > p->vpts_ns)
-               p->vpts_ns = pkt.timestamp;
-         }
-      }
-      p->seeking = 0;
-      if (!shown_now)   /* nothing due this run: hold the picture */
-         MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
-            p->width * sizeof(uint32_t));
-      /* every display slot shown and a further interval elapsed: the
-       * stream is over (the packet reader no longer runs each frame,
-       * so it cannot notice on its own) */
-      if (p->nvts > 0 && p->vshown >= p->nvts && !shown_now
-            && (!p->dt || data_transfer_complete(p->dt)
-               || data_transfer_failed(p->dt)))
-         p->eof = 1;
-   }
-   else
-   {
-      int audio_done = 1;
-#ifdef MEDIA_HAVE_AUDIO
-      if (p->actx && !p->aeof)
-         audio_done = 0;
-#endif
-      MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
-         p->width * sizeof(uint32_t));
-      if (audio_done)
-         MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-   }
+   media_run_webm_cpu(p, 1);
 
 audio:
 #ifdef MEDIA_HAVE_AUDIO
@@ -1834,7 +1912,8 @@ audio:
          target = p->apos + (int64_t)((double)p->arate / p->fps) + 1;
       if (p->atotal >= 0 && target > p->atotal)
          target = p->atotal;
-      if (p->atotal >= 0 && p->apos >= p->atotal)
+      if (p->atotal >= 0 && p->apos >= p->atotal
+            && !media_audio_may_grow(p))
          p->aeof = 1;
       while (p->apos < target)
       {
@@ -1859,6 +1938,11 @@ audio:
          }
          if (r != AUDIO_PROCESS_NEXT || !got)
          {
+            /* A demuxed progressive source can grow after this read.
+             * Keep its decoder and position until more bytes arrive. */
+            if ((r == AUDIO_PROCESS_NEXT || r == AUDIO_PROCESS_END)
+                  && media_audio_may_grow(p))
+               break;
             p->aeof = 1;
             break;
          }
@@ -2204,6 +2288,9 @@ static bool media_load_mp4(media_player_t *p)
                   free(p->asizes);
                   p->apkts  = NULL;
                   p->asizes = NULL;
+                  p->apkts_used = p->anpkts = p->anpkts_cap = 0;
+                  rmp4_close(p->agather);
+                  p->agather = NULL;
                }
             }
          }
@@ -2233,7 +2320,7 @@ static bool media_load_mp4(media_player_t *p)
    if (!p->mp4_hw_required && !media_hw_refresh
          && !media_make_framebuffer(p))
       return false;
-   p->silence_frames = (size_t)(MEDIA_AUDIO_RATE / p->fps) + 1;
+   p->silence_frames = (size_t)(media_audio_rate(p) / p->fps) + 1;
    p->frame_ns       = (int64_t)(1000000000.0 / p->fps + 0.5);
    p->silence = (int16_t*)calloc(p->silence_frames * 2, sizeof(int16_t));
    if (!p->silence)
@@ -2581,7 +2668,7 @@ bool MEDIA_CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
    if (!p->webm_hw_required && !media_hw_refresh
          && !media_make_framebuffer(p))
       goto error;
-   p->silence_frames = (size_t)(MEDIA_AUDIO_RATE / p->fps) + 1;
+   p->silence_frames = (size_t)(media_audio_rate(p) / p->fps) + 1;
    p->frame_ns       = (int64_t)(1000000000.0 / p->fps + 0.5);
    /* pace from the first frame's timestamp, wherever the container
     * starts its clock */
