@@ -1083,6 +1083,9 @@ static int64_t media_seek_internal(media_player_t *p, int64_t target_ns,
       int64_t ms;
       media_drop_hw(p);
       ms = rmp4_video_stream_seek_ms(p->mp4vs, target_ns / 1000000);
+      /* States restore by display ordinal. Seeking consumes pictures
+       * without passing through the normal playback counter. */
+      p->vshown = rmp4_video_stream_frame_index(p->mp4vs);
       p->hw_video = media_hw_refresh && rmp4_video_stream_set_hw(p->mp4vs, 0);
       p->vpts_ns = ms >= 0 ? ms * 1000000 : 0;
       p->play_ns = p->vpts_ns;
@@ -1300,6 +1303,16 @@ void media_video_hw_ready(void)
 #endif
 {
    media_player_t *p = &media_player;
+   if (p->hw_video && (!media_hw_refresh
+            || !media_hw_refresh(media_hw_user, NULL)))
+   {
+#ifdef RARCH_INTERNAL
+      libretro_media_suspend_video_hw();
+#else
+      media_suspend_video_hw();
+#endif
+   }
+
    if (p->webm && (p->codec == RWEBM_CODEC_VP9
             || p->webm_hw_required) && !p->hw_started)
    {
@@ -1343,18 +1356,55 @@ void media_video_hw_ready(void)
 #ifdef HAVE_RMP4
    if (p->mp4vs)
    {
+      if (p->hw_restart && p->dt && p->discarded)
+      {
+         if (!data_transfer_refill(p->dt, 0))
+         {
+            p->hw_restart = 0;
+            p->eof = 1;
+            return;
+         }
+         p->discarded = 0;
+      }
       if (!p->hw_started)
       {
          bool ready = media_hw_refresh
             && media_hw_refresh(media_hw_user, NULL);
          p->hw_started = 1;
          p->hw_video = ready && rmp4_video_stream_set_hw(p->mp4vs, 1);
-         if (p->hw_restart)
+      }
+      if (p->hw_restart)
+      {
+         /* A backend replacement is not a user seek. Resume at the next
+          * display ordinal and leave the video clock and PCM state intact.
+          * Millisecond timestamps lose the fractional frame duration and
+          * can include an MP4 composition offset. */
+         if (p->vshown > INT_MAX || (p->hw_restart == 1
+               && rmp4_video_stream_seek_frame(p->mp4vs,
+                     (int)p->vshown) < 0))
          {
-            int64_t target = p->hw_restart_ns;
             p->hw_restart = 0;
-            if (media_seek(p, target) + 500000000 < target)
-               p->pending_seek_ns = target;
+            p->eof = 1;
+            return;
+         }
+         p->hw_restart = 2;
+         while (rmp4_video_stream_frame_index(p->mp4vs) < p->vshown)
+         {
+            int result = rmp4_video_stream_discard(p->mp4vs, NULL);
+            if (result == 2)
+               break;
+            if (result != 1)
+            {
+               p->hw_restart = 0;
+               p->eof = 1;
+               return;
+            }
+         }
+         if (rmp4_video_stream_frame_index(p->mp4vs) == p->vshown)
+         {
+            p->hw_video = media_hw_refresh
+               && rmp4_video_stream_set_hw(p->mp4vs, 0);
+            p->hw_restart = 0;
          }
       }
    }
@@ -1508,6 +1558,12 @@ void MEDIA_CORE_PREFIX(retro_run)(void)
             media_mp4_audio_pump(p);
          }
 #endif
+      }
+
+      if (p->hw_restart)
+      {
+         MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
+         goto audio;
       }
 
       /* Terminal short states are latched outside the fill block:

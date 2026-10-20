@@ -24972,7 +24972,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_COMBO_HOLD,
-   "Instant acts the moment all of the buttons are down. Hold For waits until they have been held together for a time you choose next, so that pressing them briefly - in the middle of a game, say - does nothing."
+   "Instant acts the moment all of the buttons are down. Hold For waits until they have been held together for a time you choose next, so that pressing them briefly - in the middle of a game, say - does nothing. Press Depth waits until they are pushed in as far as you choose next, so that analog triggers and pressure-sensitive buttons (DualShock 2 and 3) only act when pressed hard."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_COMBO_HOLD_TIME,
@@ -24981,6 +24981,14 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_COMBO_HOLD_TIME,
    "How long all of the combination's buttons must be held down together before it acts."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_COMBO_DEPTH,
+   "Press Depth"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_COMBO_DEPTH,
+   "How far in each of the combination's buttons must be pushed before it acts: for analog triggers and pressure-sensitive buttons. A button that only reads pressed or not counts as pushed all the way."
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_REMAP_FIND,
@@ -31689,6 +31697,14 @@ MSG_HASH( /* Under the same entry: selecting it makes the controller connect to 
    MENU_ENUM_LABEL_VALUE_PORT_BT_PAIR,
    "- Pair with This Computer"
    )
+MSG_HASH( /* Under a DualShock 3 that Windows' own driver cannot start: selecting it moves every DualShock 3 plugged in to Windows' WinUSB driver, after one administrator prompt */
+   MENU_ENUM_LABEL_VALUE_PORT_DS3_ENABLE,
+   "- Enable DualShock 3 Support"
+   )
+MSG_HASH( /* Under a DualShock 3 on WinUSB: selecting it gives every DualShock 3 plugged in back to the driver Windows chooses itself */
+   MENU_ENUM_LABEL_VALUE_PORT_DS3_RESTORE,
+   "- Restore Windows Driver"
+   )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CHEAT_SETTINGS,
    "Cheat Settings"
@@ -32937,6 +32953,30 @@ MSG_HASH(
    "Port %u's controller could not be paired with this computer."
    )
 MSG_HASH(
+   MSG_INPUT_DS3_ASKING,
+   "Changing the DualShock 3 driver: allow it in the Windows prompt."
+   )
+MSG_HASH(
+   MSG_INPUT_DS3_ENABLED,
+   "DualShock 3 support enabled. The controller reconnects by itself."
+   )
+MSG_HASH(
+   MSG_INPUT_DS3_RESTORED,
+   "DualShock 3 given back to the Windows driver."
+   )
+MSG_HASH(
+   MSG_INPUT_DS3_NOT_CHANGED,
+   "The DualShock 3 driver could not be changed."
+   )
+MSG_HASH(
+   MSG_INPUT_DS3_DECLINED,
+   "The DualShock 3 driver was not changed: administrator rights were not given."
+   )
+MSG_HASH( /* %s is the controller's name, %u its port */
+   MSG_INPUT_DS3_NEEDS_ENABLING,
+   "%s (port %u) needs enabling: Information > Input Information > Enable DualShock 3 Support."
+   )
+MSG_HASH(
    MSG_INPUT_COMBO_SET_BUTTONS,
    "Set Buttons"
    )
@@ -32955,6 +32995,14 @@ MSG_HASH(
 MSG_HASH(
    MSG_INPUT_COMBO_HOLD_FOR,
    "Hold For"
+   )
+MSG_HASH(
+   MSG_INPUT_COMBO_PRESS_DEPTH,
+   "Press Depth"
+   )
+MSG_HASH(
+   MSG_INPUT_COMBO_DEPTH_PERCENT,
+   "%u%% Pressed In"
    )
 MSG_HASH(
    MSG_INPUT_COMBO_ROW_SUBLABEL,

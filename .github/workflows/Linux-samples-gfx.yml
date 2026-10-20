@@ -28,9 +28,28 @@ jobs:
       - name: Install Metal lease mock dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang libgnustep-base-dev libblocksruntime-dev
+          sudo apt-get install -y -qq clang libgnustep-base-dev libblocksruntime-dev ffmpeg
       - name: Strict C89 geometry with Clang
         run: CC=clang python3 samples/gfx/metal_frame/run.py
+      - name: VideoToolbox HEVC parameter ownership and session setup
+        run: |
+          python3 samples/gfx/videotoolbox_hevc/codec_fixtures.py --verify
+          python3 samples/gfx/videotoolbox_hevc/hdr_codec_fixtures.py --verify
+          python3 samples/gfx/videotoolbox_hevc/sequence_fixtures.py --verify
+          CC=clang python3 samples/gfx/videotoolbox_hevc/run.py --apple-limits
+          python3 samples/gfx/videotoolbox_hevc/run.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 samples/gfx/videotoolbox_hevc/run.py
+          python3 samples/gfx/videotoolbox_hevc/run.py --threadless
+          CFLAGS='-DRETRO_ATOMIC_FORCE_VOLATILE -DRETRO_ATOMIC_SUPPRESS_WARNING' python3 samples/gfx/videotoolbox_hevc/run.py
+          TSAN_OPTIONS=halt_on_error=1 CFLAGS='-fsanitize=thread -fno-omit-frame-pointer' RUNNER="setarch $(uname -m) -R" python3 samples/gfx/videotoolbox_hevc/run.py
+      - name: HEVC software and hardware sequencing regression
+        working-directory: libretro-common/samples/formats/h265
+        run: |
+          make -j2 all SANITIZER=address,undefined
+          ./rh265_malformed_test
+          ./rh265_lossless_test
+          ./rh265_lossless_test_nothreads
+          ./rh265_lossless_test_volatile
       - name: Retained Metal lease ownership and completion
         run: python3 samples/gfx/metal_frame/run.py --mock
 
@@ -1449,6 +1468,7 @@ jobs:
         run: |
           set -eu
           CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/movie_gpu_handoff/run.py
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=thread -fno-omit-frame-pointer" python3 samples/gfx/movie_gpu_handoff/run.py
           CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/movie_gpu_handoff/run.py
 
       - name: D3D12 descriptor cache resource lifetime (Linux and mingw + Wine)
@@ -2324,6 +2344,12 @@ jobs:
              ./preview_audio_decode_test fixtures/trailing_large.mp4 1024 island
              ./preview_audio_decode_test fixtures/trailing_large.mp4 262144 island'
           echo "[pass] preview_audio_decode_test (TSan)"
+
+      - name: MinGW strict C89 float math
+        run: CC=x86_64-w64-mingw32-gcc WINEDEBUG=-all python3 samples/gfx/mingw_c89_math/run.py
+
+      - name: Vulkan synchronous readback slot
+        run: python3 samples/gfx/vulkan_readback_slot/run.py
 
       - name: Build and run hw_ring_fence_test (ASan + UBSan, TSan)
         shell: bash

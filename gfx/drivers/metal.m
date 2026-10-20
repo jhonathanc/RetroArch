@@ -210,6 +210,7 @@ typedef NS_ENUM(NSUInteger, ViewportResetMode) {
 @property (nonatomic, readonly) id<MTLDevice> device;
 @property (nonatomic, readonly) id<MTLLibrary> library;
 @property (nonatomic, readonly) void *frameSDRPipeline;
+@property(nonatomic, readonly) BOOL movieHDRSupported;
 @property (nonatomic, readwrite) MTLClearColor clearColor;
 @property (nonatomic, readwrite) video_viewport_t *viewport;
 @property (nonatomic, readonly) Uniforms *uniforms;
@@ -344,7 +345,7 @@ typedef NS_ENUM(NSUInteger, ViewportResetMode) {
 #if METAL_HDR_AVAILABLE
 - (void)hdrComposite:(const HDRUniforms *)uniforms
           fromSource:(id<MTLTexture>)source
-            rotation:(unsigned)rotation;
+            rotation:(unsigned)rotation movieLinear:(BOOL)movieLinear;
 #endif
 
 /* HDR-specific setters exposed for the poke interface. */
@@ -465,6 +466,9 @@ typedef struct metal_view_chain metal_view_chain_t;
 @interface FrameView : NSObject
 
 @property(nonatomic, readonly) RPixelFormat format;
+@property(nonatomic, readonly) BOOL movieFrame;
+@property(nonatomic, readonly) BOOL movieHDR;
+- (enum video_texture_update)importMovieFrame:(const video_frame_import_t *)frame;
 @property(nonatomic, readonly) RTextureFilter filter;
 @property(nonatomic, readwrite) BOOL visible;
 @property(nonatomic, readwrite) CGRect frame;
@@ -938,7 +942,22 @@ void *metal_frame_sdr_pipeline_create(void *device)
       " float2 c = uv.read(q >> 1).rg * p.levels.z + p.levels.w;\n"
       " float3 rgb = saturate(float3(luma) + float3(p.k.x * c.y,\n"
       "    p.k.y * c.x + p.k.z * c.y, p.k.w * c.x));\n"
-      " if (p.mode.x == 1u) {\n"
+      " if (p.mode.x == 16u || p.mode.x == 18u) {\n"
+      "    float3 l;\n"
+      "    if (p.mode.x == 16u) {\n"
+      "       float3 v = pow(rgb, float3(1.0f / 78.84375f));\n"
+      "       l = 125.0f * pow(max(v - 0.8359375f, float3(0.0f)) /\n"
+      "          (18.8515625f - 18.6875f * v), float3(1.0f / 0.1593017578125f));\n"
+      "    } else {\n"
+      "       float3 scene = select((exp((rgb - 0.55991073f) / 0.17883277f) +\n"
+      "          0.28466892f) / 12.0f, rgb * rgb / 3.0f, rgb <= float3(0.5f));\n"
+      "       float luminance = dot(scene, float3(0.2627f, 0.6780f, 0.0593f));\n"
+      "       l = scene * (12.5f * pow(luminance, 0.2f));\n"
+      "    }\n"
+      "    rgb = float3(dot(l, float3(1.660491f, -0.587641f, -0.072850f)),\n"
+      "       dot(l, float3(-0.124550f, 1.132900f, -0.008349f)),\n"
+      "       dot(l, float3(-0.018151f, -0.100579f, 1.118730f)));\n"
+      " } else if (p.mode.x == 1u) {\n"
       "    float3 l = select(pow((rgb + 0.099f) / 1.099f, float3(1.0f / 0.45f)),\n"
       "       rgb / 4.5f, rgb < float3(0.081f));\n"
       "    rgb = select(1.055f * pow(l, float3(1.0f / 2.4f)) - 0.055f,\n"
@@ -991,8 +1010,8 @@ static bool metal_frame_sdr_encode(void *user, const metal_frame_view_t *view,
    return true;
 }
 
-bool metal_frame_convert_sdr(const struct video_frame_import *frame,
-      void *device, void *command_buffer, void *pipeline, void *destination)
+static bool metal_frame_convert_planar(const struct video_frame_import *frame,
+      void *device, void *command_buffer, void *pipeline, void *destination, bool hdr)
 {
    RArchMetalFrameLease *lease = metal_frame_validate(frame, device, command_buffer);
    id<MTLCommandBuffer> buffer = (__bridge id<MTLCommandBuffer>)command_buffer;
@@ -1001,16 +1020,27 @@ bool metal_frame_convert_sdr(const struct video_frame_import *frame,
    metal_frame_sdr_copy_t copy;
    if (!lease || !texture || !kernel || !buffer.retainedReferences
          || kernel.device != lease->device || kernel.maxTotalThreadsPerThreadgroup < 64
-         || (frame->output_pixfmt && frame->output_pixfmt != IMAGE_PIXFMT_8888)
+         || (frame->output_pixfmt && frame->output_pixfmt != (hdr ? IMAGE_PIXFMT_FP16 : IMAGE_PIXFMT_8888))
          || texture == lease->planes[0] || texture == lease->planes[1]
-         || !metal_frame_texture_valid(texture, lease->device, MTLPixelFormatRGBA8Unorm)
+         || !metal_frame_texture_valid(texture, lease->device, hdr ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm)
          || texture.width != lease->view.width || texture.height != lease->view.height
          || texture.mipmapLevelCount != 1 || !(texture.usage & MTLTextureUsageShaderWrite)
-         || !metal_frame_sdr_params(&lease->view, &copy.params))
+         || !(hdr ? metal_frame_hdr_params(&lease->view, &copy.params)
+               : metal_frame_sdr_params(&lease->view, &copy.params)))
       return false;
    copy.pipeline = pipeline;
    copy.destination = destination;
    return metal_frame_encode(frame, device, command_buffer, metal_frame_sdr_encode, &copy);
+}
+bool metal_frame_convert_sdr(const struct video_frame_import *frame,
+      void *device, void *command_buffer, void *pipeline, void *destination)
+{
+   return metal_frame_convert_planar(frame, device, command_buffer, pipeline, destination, false);
+}
+bool metal_frame_convert_hdr(const struct video_frame_import *frame,
+      void *device, void *command_buffer, void *pipeline, void *destination)
+{
+   return metal_frame_convert_planar(frame, device, command_buffer, pipeline, destination, true);
 }
 /* METAL_FRAME_SDR_CONVERT_END */
 
@@ -1128,6 +1158,147 @@ done:
    return result;
 }
 /* METAL_FRAME_CV_END */
+
+/* METAL_FRAME_CV_POOL_BEGIN */
+struct metal_frame_cv_pool
+{
+   const void *device, *cache, *ready, *listener, *done[32];
+   uint64_t value[32];
+   unsigned count, next;
+};
+
+void metal_frame_cv_pool_free(metal_frame_cv_pool_t *pool)
+{
+   unsigned i;
+   if (!pool) return;
+   for (i = 0; i < pool->count; i++)
+      if (pool->done[i]) CFRelease(pool->done[i]);
+   if (pool->listener) CFRelease(pool->listener);
+   if (pool->ready) CFRelease(pool->ready);
+   if (pool->cache) CFRelease(pool->cache);
+   if (pool->device) CFRelease(pool->device);
+   free(pool);
+}
+
+metal_frame_cv_pool_t *metal_frame_cv_pool_new(void *device, void *cache,
+      void *ready, void *listener, void *const *done, unsigned count)
+{
+   metal_frame_cv_pool_t *pool;
+   unsigned i, j;
+   Class listener_class = NSClassFromString(@"MTLSharedEventListener");
+   if (!device || !cache || !listener_class || !listener || !done
+         || !count || count > 32
+         || ![(__bridge id)listener isKindOfClass:listener_class]
+         || !metal_frame_event_valid((__bridge id)ready, (__bridge id)device)
+         || [(id<RArchMetalSharedEvent>)(__bridge id)ready signaledValue] < 1)
+      return NULL;
+   for (i = 0; i < count; i++)
+   {
+      if (done[i] == ready
+            || !metal_frame_event_valid((__bridge id)done[i], (__bridge id)device)
+            || [(id<RArchMetalSharedEvent>)(__bridge id)done[i] signaledValue])
+         return NULL;
+      for (j = 0; j < i; j++) if (done[i] == done[j]) return NULL;
+   }
+   pool = (metal_frame_cv_pool_t*)calloc(1, sizeof(*pool));
+   if (!pool) return NULL;
+   pool->count = count;
+   pool->device = CFRetain(device); pool->cache = CFRetain(cache);
+   pool->ready = CFRetain(ready); pool->listener = CFRetain(listener);
+   for (i = 0; i < count; i++) pool->done[i] = CFRetain(done[i]);
+   return pool;
+}
+
+int metal_frame_cv_pool_export(metal_frame_cv_pool_t *pool,
+      const metal_frame_view_t *metadata, void *image, video_hw_frame_t *out)
+{
+   unsigned n;
+   if (!pool || !metadata || !image || !out
+         || metadata->planes[0] || metadata->planes[1]) return -1;
+   for (n = 0; n < pool->count; n++)
+   {
+      unsigned i = (pool->next + n) % pool->count;
+      id<RArchMetalSharedEvent> done = (__bridge id<RArchMetalSharedEvent>)pool->done[i];
+      metal_frame_source_t source;
+      if (pool->value[i] == ~(uint64_t)0 || done.signaledValue < pool->value[i])
+         continue;
+      memset(&source, 0, sizeof(source));
+      source.device = (void*)pool->device; source.ready = (void*)pool->ready;
+      source.done = (void*)pool->done[i]; source.listener = (void*)pool->listener;
+      source.ready_value = 1; source.done_value = pool->value[i] + 1;
+      source.pixfmt = metadata->pixfmt; source.width = metadata->width;
+      source.height = metadata->height; source.crop_x = metadata->crop_x;
+      source.crop_y = metadata->crop_y; source.yuv = metadata->yuv;
+      source.color = metadata->color;
+      if (!metal_frame_create_cv(&source, image, (void*)pool->cache, out)) return -1;
+      pool->value[i] = source.done_value; pool->next = (i + 1) % pool->count;
+      return 0;
+   }
+   return 1;
+}
+/* METAL_FRAME_CV_POOL_END */
+
+/* METAL_FRAME_CV_POOL_SETUP_BEGIN */
+#include <dispatch/dispatch.h>
+@protocol RArchMetalPoolDevice <MTLDevice>
+- (id)newSharedEvent;
+@end
+@protocol RArchMetalPoolListener <NSObject>
+- (id)initWithDispatchQueue:(dispatch_queue_t)queue;
+@end
+
+metal_frame_cv_pool_t *metal_frame_cv_pool_create(void *opaque, unsigned count)
+{
+   @autoreleasepool
+   {
+      id<RArchMetalPoolDevice> device = (__bridge id<RArchMetalPoolDevice>)opaque;
+      Class listener_class = NSClassFromString(@"MTLSharedEventListener");
+      id<RArchMetalSharedEvent> ready = nil;
+      id events[32] = { nil }, listener = nil;
+      void *done[32];
+      CVMetalTextureCacheRef cache = NULL;
+      metal_frame_cv_pool_t *pool = NULL;
+      unsigned i;
+      if (!device || !count || count > 32 || !listener_class
+            || ![device respondsToSelector:@selector(newSharedEvent)]) return NULL;
+      ready = [device newSharedEvent];
+      listener = [(id<RArchMetalPoolListener>)[listener_class alloc]
+         initWithDispatchQueue:dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0)];
+      if (!ready || !listener
+            || CVMetalTextureCacheCreate(NULL, NULL, device, NULL, &cache) != kCVReturnSuccess
+            || !cache) goto done;
+      [ready setSignaledValue:1];
+      for (i = 0; i < count; i++)
+      {
+         events[i] = [device newSharedEvent];
+         if (!events[i]) goto done;
+         done[i] = (__bridge void*)events[i];
+      }
+      pool = metal_frame_cv_pool_new(opaque, cache, (__bridge void*)ready,
+            (__bridge void*)listener, done, count);
+done:
+      if (cache) CFRelease(cache);
+      for (i = 0; i < count; i++) RARCH_RELEASE(events[i]);
+      RARCH_RELEASE(ready); RARCH_RELEASE(listener);
+      return pool;
+   }
+}
+/* METAL_FRAME_CV_POOL_SETUP_END */
+
+#if defined(HAVE_RMP4) && defined(HAVE_THREADS) \
+      && ((defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 101300) \
+         || (defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 110000) \
+         || (defined(__TV_OS_VERSION_MAX_ALLOWED) && __TV_OS_VERSION_MAX_ALLOWED >= 110000))
+#include "../common/metal_hevc_driver.h"
+#ifdef METAL_HEVC_DRIVER
+static bool metal_hevc_decode_enabled(void *unused)
+{
+   const settings_t *settings = config_get_ptr();
+   (void)unused;
+   return !settings || settings->uints.video_hw_decode != VIDEO_HW_DECODE_OFF;
+}
+#endif
+#endif
 
 /* video_hdr_mode values — must match the rest of RetroArch. */
 #define METAL_HDR_MODE_OFF    0u
@@ -1573,6 +1744,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
     * the UI layer over the core.  Two variants per HDR output mode. */
    id<MTLRenderPipelineState> _hdrCompositeStateHDR10;
    id<MTLRenderPipelineState> _hdrCompositeStateSCRGB;
+   id<MTLRenderPipelineState> _hdrMovieCompositeStateHDR10, _hdrMovieCompositeStateSCRGB;
    id<MTLRenderPipelineState> _hdrMenuCompositeStateHDR10;
    id<MTLRenderPipelineState> _hdrMenuCompositeStateSCRGB;
    /* Tonemap ("run HDR offscreen back down to BGRA8 for readback"). */
@@ -1680,6 +1852,14 @@ static void buffer_chain_discard(buffer_chain_t *chain);
 }
 
 - (void *)frameSDRPipeline { return _frameSDRPipeline; }
+- (BOOL)movieHDRSupported
+{
+#if METAL_HDR_AVAILABLE
+   return _hdrEnabled && _hdrMovieCompositeStateHDR10 && _hdrMovieCompositeStateSCRGB;
+#else
+   return NO;
+#endif
+}
 
 - (void)dealloc
 {
@@ -1722,6 +1902,8 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    [(id)_sdrOverlayTex release];
    [(id)_hdrCompositeStateHDR10 release];
    [(id)_hdrCompositeStateSCRGB release];
+   [(id)_hdrMovieCompositeStateHDR10 release];
+   [(id)_hdrMovieCompositeStateSCRGB release];
    [(id)_hdrMenuCompositeStateHDR10 release];
    [(id)_hdrMenuCompositeStateSCRGB release];
    [(id)_hdrTonemapState release];
@@ -2273,6 +2455,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    id<MTLFunction> vs = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"hdr_composite_vertex"]);
    id<MTLFunction> fsComp = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"hdr_composite_fragment"]);
    id<MTLFunction> fsTone = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"hdr_tonemap_fragment"]);
+   id<MTLFunction> fsMovie = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"hdr_movie_fragment"]);
    if (!vs || !fsComp || !fsTone)
    {
       RARCH_ERR("[Metal] HDR pipelines: missing shader functions.\n");
@@ -2283,14 +2466,14 @@ static void buffer_chain_discard(buffer_chain_t *chain);
     * pixel format, label, and blend-enable flag.  Blend mode when
     * enabled matches Vulkan's HDR pipeline (SRC_ALPHA / ONE_MINUS_SRC_ALPHA
     * for both colour and alpha channels). */
-   id<MTLRenderPipelineState> (^makeComposite)(MTLPixelFormat, NSString *, BOOL) =
-   ^id<MTLRenderPipelineState>(MTLPixelFormat fmt, NSString *label, BOOL blend)
+   id<MTLRenderPipelineState> (^makeComposite)(MTLPixelFormat, NSString *, BOOL, id<MTLFunction>) =
+   ^id<MTLRenderPipelineState>(MTLPixelFormat fmt, NSString *label, BOOL blend, id<MTLFunction> fragment)
    {
       NSError *e = nil;
       MTLRenderPipelineDescriptor *psd = RARCH_AUTORELEASE_R([MTLRenderPipelineDescriptor new]);
       psd.label            = label;
       psd.vertexFunction   = vs;
-      psd.fragmentFunction = fsComp;
+      psd.fragmentFunction = fragment;
       MTLRenderPipelineColorAttachmentDescriptor *ca = psd.colorAttachments[0];
       ca.pixelFormat = fmt;
       if (blend)
@@ -2312,23 +2495,37 @@ static void buffer_chain_discard(buffer_chain_t *chain);
 
    _hdrCompositeStateHDR10     = makeComposite(MTLPixelFormatRGB10A2Unorm,
                                                @"HDR composite core (HDR10)",
-                                               NO);
+                                               NO, fsComp);
    if (!_hdrCompositeStateHDR10) return NO;
 
    _hdrCompositeStateSCRGB     = makeComposite(MTLPixelFormatRGBA16Float,
                                                @"HDR composite core (scRGB)",
-                                               NO);
+                                               NO, fsComp);
    if (!_hdrCompositeStateSCRGB) return NO;
 
    _hdrMenuCompositeStateHDR10 = makeComposite(MTLPixelFormatRGB10A2Unorm,
                                                @"HDR composite menu (HDR10)",
-                                               YES);
+                                               YES, fsComp);
    if (!_hdrMenuCompositeStateHDR10) return NO;
 
    _hdrMenuCompositeStateSCRGB = makeComposite(MTLPixelFormatRGBA16Float,
                                                @"HDR composite menu (scRGB)",
-                                               YES);
+                                               YES, fsComp);
    if (!_hdrMenuCompositeStateSCRGB) return NO;
+
+   /* Optional movie pipelines must not change the core HDR startup gate. */
+   if (fsMovie)
+   {
+      _hdrMovieCompositeStateHDR10 = makeComposite(MTLPixelFormatRGB10A2Unorm,
+            @"HDR movie (linear scRGB to PQ)", NO, fsMovie);
+      _hdrMovieCompositeStateSCRGB = makeComposite(MTLPixelFormatRGBA16Float,
+            @"HDR movie (linear scRGB)", NO, fsMovie);
+      if (!_hdrMovieCompositeStateHDR10 || !_hdrMovieCompositeStateSCRGB)
+      {
+         RARCH_RELEASE_NIL(_hdrMovieCompositeStateHDR10);
+         RARCH_RELEASE_NIL(_hdrMovieCompositeStateSCRGB);
+      }
+   }
 
    /* Tonemap (for screenshot/readback path). */
    {
@@ -2573,7 +2770,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
  * encoder), opens the drawable, runs both passes, leaves _rce = nil. */
 - (void)hdrComposite:(const HDRUniforms *)uniforms
           fromSource:(id<MTLTexture>)source
-            rotation:(unsigned)rotation
+            rotation:(unsigned)rotation movieLinear:(BOOL)movieLinear
 {
    if (!_hdrEnabled || !uniforms)
       return;
@@ -2614,8 +2811,8 @@ static void buffer_chain_discard(buffer_chain_t *chain);
       rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
       id<MTLRenderPipelineState> state = scRGB
-         ? _hdrCompositeStateSCRGB
-         : _hdrCompositeStateHDR10;
+         ? (movieLinear ? _hdrMovieCompositeStateSCRGB : _hdrCompositeStateSCRGB)
+         : (movieLinear ? _hdrMovieCompositeStateHDR10 : _hdrCompositeStateHDR10);
 
       /* Patch CoreViewport into a local uniforms copy; caller's buffer
        * stays untouched. */
@@ -2626,6 +2823,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
                                             (float)VIDEO_SCALE_H(_viewport.dims));
       /* Core content rotation.  Both sources arrive unrotated. */
       local.Rotation     = rotation & 3u;
+      if (movieLinear) local.HDRMode = scRGB ? 2u : 1u;
 
       id<MTLRenderCommandEncoder> cre = [_commandBuffer renderCommandEncoderWithDescriptor:rpd];
       cre.label = @"HDR composite (core)";
@@ -6491,7 +6689,7 @@ static void metal_views_render(metal_views_t *vs,
       _frameView.hdrPaperWhiteNits = video_info->hdr_paper_white_nits;
       _frameView.hdrPeakNits = video_info->hdr_max_nits;
       _frameView.hdrExpandGamut = video_info->hdr_expand_gamut;
-      if (frame && width && height)
+      if (frame && frame != RETRO_HW_FRAME_BUFFER_VALID && width && height)
       {
          struct video_shader *shader = _frameView.shader;
          _frameView.size      = CGSizeMake(width, height);
@@ -6503,6 +6701,8 @@ static void metal_views_render(metal_views_t *vs,
             [_frameView updateFrame:frame pitch:pitch];
          _frameEverUploaded   = true;
       }
+      else if (_frameView.movieFrame)
+         _frameEverUploaded = true;
       else if (!_frameEverUploaded)
       {
          /* Driver just came up (init or post-reinit).  The frontend
@@ -6713,7 +6913,8 @@ static void metal_views_render(metal_views_t *vs,
          id<MTLTexture>    src = _frameView.shaderOutputTexture;
          if (!src)
             src = _frameView.frameTexture;
-         [_context hdrComposite:u fromSource:src rotation:rot];
+         [_context hdrComposite:u fromSource:src rotation:rot
+               movieLinear:(_frameView.movieHDR && !_frameView.shaderOutputTexture)];
       }
 #endif
 
@@ -6997,9 +7198,12 @@ struct metal_view_chain
    struct video_shader *_shader;
 
    engine_t _engine;
+   texture_t _moviePrevious[GFX_MAX_FRAME_HISTORY + 1];
 
    bool resize_render_targets;
    bool init_history;
+   BOOL _movieFrame;
+   BOOL _movieHDR;
    video_viewport_t *_viewport;
 
    /* HDR state.
@@ -7021,6 +7225,8 @@ struct metal_view_chain
 }
 
 - (BOOL)hdrEnabled { return _hdrEnabled; }
+- (BOOL)movieFrame { return _movieFrame; }
+- (BOOL)movieHDR { return _movieFrame && _movieHDR; }
 - (id<MTLTexture>)frameTexture { return _engine.frame.texture[0].view; }
 
 - (id<MTLTexture>)shaderOutputTexture
@@ -7099,7 +7305,10 @@ struct metal_view_chain
    [self _freeVideoShader:_shader];
    _shader = NULL;
    for (i = 0; i < GFX_MAX_FRAME_HISTORY + 1; i++)
+   {
       RARCH_STRUCT_ASSIGN(_engine.frame.texture[i].view, nil);
+      RARCH_STRUCT_ASSIGN(_moviePrevious[i].view, nil);
+   }
 
 #if !__has_feature(objc_arc)
    {
@@ -7268,6 +7477,7 @@ struct metal_view_chain
 
 - (CGRect)frame { return _frame; }
 
+/* METAL_FRAME_HISTORY_BEGIN */
 - (void)_updateHistory
 {
    if (_shader)
@@ -7277,7 +7487,8 @@ struct metal_view_chain
          if (init_history)
          {
             int i;
-            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                     _movieFrame ? (_movieHDR ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm) : MTLPixelFormatBGRA8Unorm
                      width:(NSUInteger)_size.width
                      height:(NSUInteger)_size.height
                      mipmapped:false];
@@ -7304,23 +7515,24 @@ struct metal_view_chain
 
    [self _ensureFront];
 }
+/* METAL_FRAME_HISTORY_END */
 
 /* The front slot at the frame's size: no history, or one of another
  * size moved there */
+/* METAL_FRAME_FRONT_BEGIN */
 - (void)_ensureFront
 {
+   MTLPixelFormat wanted = _movieFrame ? (_movieHDR ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm)
+      : _format == RPixelFormatBGR10A2Unorm ? MTLPixelFormatBGR10A2Unorm : MTLPixelFormatBGRA8Unorm;
    if (   _engine.frame.texture[0].size_data.x != _size.width
-       || _engine.frame.texture[0].size_data.y != _size.height)
+       || _engine.frame.texture[0].size_data.y != _size.height
+       || _engine.frame.texture[0].view.pixelFormat != wanted)
    {
       /* The front slot receives the uploaded source frame directly, so for a
        * native 10-bit source it must be BGR10A2 (which matches the ABI's
        * XRGB2101010 packing with no swizzle); all other formats upload into
        * or convert to BGRA8. */
-      MTLPixelFormat frameFmt =
-            (_format == RPixelFormatBGR10A2Unorm)
-            ? MTLPixelFormatBGR10A2Unorm
-            : MTLPixelFormatBGRA8Unorm;
-      MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:frameFmt
+      MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:wanted
                width:(NSUInteger)_size.width
                height:(NSUInteger)_size.height
                mipmapped:false];
@@ -7328,6 +7540,16 @@ struct metal_view_chain
       [self _initTexture:&_engine.frame.texture[0] withDescriptor:td];
    }
 }
+/* METAL_FRAME_FRONT_END */
+/* METAL_MOVIE_CLEAR_BEGIN */
+- (void)_clearMovieFrame
+{
+   if (_movieHDR) init_history = YES;
+   _movieFrame = NO;
+   _movieHDR = NO;
+}
+/* METAL_MOVIE_CLEAR_END */
+
 
 - (bool)readViewport:(uint8_t *)buffer isIdle:(bool)isIdle
 {
@@ -7430,6 +7652,7 @@ struct metal_view_chain
 
 - (bool)deferFrame:(void const *)src pitch:(NSUInteger)pitch
 {
+   [self _clearMovieFrame];
    [self syncViewport];
    [self _ensureFront];
    _pendingSrc   = src;
@@ -7455,6 +7678,7 @@ struct metal_view_chain
 
 - (void)updateFrame:(void const *)src pitch:(NSUInteger)pitch
 {
+   [self _clearMovieFrame];
    [self syncViewport];
 
    [self _updateHistory];
@@ -7510,6 +7734,80 @@ struct metal_view_chain
       }
    }
 }
+
+/* METAL_MOVIE_FRAME_BEGIN */
+- (enum video_texture_update)importMovieFrame:(const video_frame_import_t *)frame
+{
+   @autoreleasepool
+   {
+      metal_frame_sdr_params_t params;
+      RArchMetalFrameLease *lease;
+      id<MTLCommandBuffer> buffer;
+      BOOL previous_movie = _movieFrame, previous_hdr = _movieHDR;
+      bool hdr, previous_init = init_history, previous_resize = resize_render_targets;
+      id<MTLTexture> previous_source;
+      CGSize previous_size = _size;
+      unsigned history_count, i;
+      if (!frame)
+      {
+         [self _clearMovieFrame];
+         return VIDEO_TEXTURE_UPDATE_DONE;
+      }
+      buffer = _context.blitCommandBuffer;
+      lease = metal_frame_validate(frame, (__bridge void*)_context.device, (__bridge void*)buffer);
+      if (!lease || !_context.frameSDRPipeline)
+         return VIDEO_TEXTURE_UPDATE_REFUSED;
+      hdr = metal_frame_hdr_params(&lease->view, &params);
+      if ((hdr ? !_context.movieHDRSupported : !metal_frame_sdr_params(&lease->view, &params))
+            || (frame->output_pixfmt && frame->output_pixfmt != (hdr ? IMAGE_PIXFMT_FP16 : IMAGE_PIXFMT_8888)))
+         return VIDEO_TEXTURE_UPDATE_REFUSED;
+      history_count = _shader && _shader->history_size > 0 ? (unsigned)_shader->history_size + 1u : 1u;
+      if (history_count > sizeof(_moviePrevious) / sizeof(_moviePrevious[0]))
+         return VIDEO_TEXTURE_UPDATE_REFUSED;
+      previous_source = RARCH_RETAIN(_src);
+      /* Persistent scratch avoids a history-sized frame allocation. Retain the
+       * old slots until all fallible destination/encoder setup has succeeded. */
+      for (i = 0; i < history_count; i++)
+      {
+         _moviePrevious[i].size_data = _engine.frame.texture[i].size_data;
+         RARCH_STRUCT_ASSIGN(_moviePrevious[i].view, _engine.frame.texture[i].view);
+      }
+      if (!_movieFrame || _movieHDR != hdr) init_history = YES;
+      _movieFrame = YES; _movieHDR = hdr;
+      self.size = CGSizeMake(lease->view.width, lease->view.height);
+      [self syncViewport];
+      [self _updateHistory];
+      if (!(hdr ? metal_frame_convert_hdr(frame, (__bridge void*)_context.device,
+               (__bridge void*)buffer, _context.frameSDRPipeline,
+               (__bridge void*)_engine.frame.texture[0].view)
+            : metal_frame_convert_sdr(frame, (__bridge void*)_context.device,
+               (__bridge void*)buffer, _context.frameSDRPipeline,
+               (__bridge void*)_engine.frame.texture[0].view)))
+      {
+         _movieFrame = previous_movie; _movieHDR = previous_hdr;
+         self.size = previous_size; init_history = previous_init;
+         resize_render_targets = previous_resize;
+         RARCH_ASSIGN(_src, previous_source);
+         RARCH_RELEASE(previous_source);
+         for (i = 0; i < history_count; i++)
+         {
+            RARCH_STRUCT_ASSIGN(_engine.frame.texture[i].view, _moviePrevious[i].view);
+            _engine.frame.texture[i].size_data = _moviePrevious[i].size_data;
+            RARCH_STRUCT_ASSIGN(_moviePrevious[i].view, nil);
+         }
+         [self syncViewport];
+         return VIDEO_TEXTURE_UPDATE_REFUSED;
+      }
+      RARCH_RELEASE(previous_source);
+      for (i = 0; i < history_count; i++)
+         RARCH_STRUCT_ASSIGN(_moviePrevious[i].view, nil);
+      _pendingSrc = NULL;
+      _srcDirty = NO;
+      _loanLast = -1;
+      return VIDEO_TEXTURE_UPDATE_DONE;
+   }
+}
+/* METAL_MOVIE_FRAME_END */
 
 /* Where a pushed frame lies in frame memory: the index of the buffer,
  * with the frame's byte offset in it, when @src at @pitch with the
@@ -7680,6 +7978,7 @@ struct metal_view_chain
    return false;
 }
 
+/* METAL_FRAME_TEXTURE_BEGIN */
 - (void)_initTexture:(texture_t *)t withDescriptor:(MTLTextureDescriptor *)td
 {
    RARCH_STRUCT_ASSIGN(t->view, RARCH_AUTORELEASE_R([_context.device newTextureWithDescriptor:td]));
@@ -7688,6 +7987,7 @@ struct metal_view_chain
    t->size_data.z = 1.0f / td.width;
    t->size_data.w = 1.0f / td.height;
 }
+/* METAL_FRAME_TEXTURE_END */
 
 - (void)drawWithEncoder:(id<MTLRenderCommandEncoder>)rce
 {
@@ -9022,6 +9322,10 @@ static void metal_init_mainthread(void *userdata)
 
    /* Store reference for context swap_buffers calls */
    metal_ctx_data = (__bridge void *)md;
+#ifdef METAL_HEVC_DRIVER
+   metal_hevc_start_supported((__bridge void*)md, (__bridge void*)md.context.device,
+         md.context.frameSDRPipeline, md.context.movieHDRSupported);
+#endif
 
    args->result   = RARCH_BRIDGE_RETAINED(RARCH_AUTORELEASE_R(md));
 }
@@ -9203,6 +9507,9 @@ static void metal_free(void *data)
    @autoreleasepool
    {
       __attribute__((unused)) MetalDriver *md = RARCH_BRIDGE_TRANSFER(MetalDriver *, data);
+#ifdef METAL_HEVC_DRIVER
+      metal_hevc_stop((__bridge void*)md);
+#endif
       metal_ctx_data = NULL;
       md = nil;
    }
@@ -10072,16 +10379,19 @@ static enum video_texture_update metal_import_texture(void *data, uintptr_t *han
       bool planar = lease && (lease->view.pixfmt == IMAGE_PIXFMT_NV12
             || lease->view.pixfmt == IMAGE_PIXFMT_P010);
       MTLPixelFormat format;
+      bool hdr = false;
       metal_frame_sdr_params_t params;
       if (!lease || (texture && (texture->_planar || texture->_stagingLent)))
          return VIDEO_TEXTURE_UPDATE_REFUSED;
       if (planar)
       {
+         hdr = metal_frame_hdr_params(&lease->view, &params);
          if (!md.context.frameSDRPipeline
-               || !metal_frame_sdr_params(&lease->view, &params)
-               || (frame->output_pixfmt && frame->output_pixfmt != IMAGE_PIXFMT_8888))
+               || (hdr ? (!md.context.hdrEnabled || ![md.context linearShader])
+                  : !metal_frame_sdr_params(&lease->view, &params))
+               || (frame->output_pixfmt && frame->output_pixfmt != (hdr ? IMAGE_PIXFMT_FP16 : IMAGE_PIXFMT_8888)))
             return VIDEO_TEXTURE_UPDATE_REFUSED;
-         format = MTLPixelFormatRGBA8Unorm;
+         format = hdr ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm;
       }
       else
       {
@@ -10103,9 +10413,11 @@ static enum video_texture_update metal_import_texture(void *data, uintptr_t *han
             width:lease->view.width height:lease->view.height filter:filter]);
       if (!target)
          return VIDEO_TEXTURE_UPDATE_REFUSED;
-      if (planar ? !metal_frame_convert_sdr(frame, (__bridge void *)device,
+      if (planar ? !(hdr ? metal_frame_convert_hdr(frame, (__bridge void *)device,
                (__bridge void *)buffer, md.context.frameSDRPipeline,
-               (__bridge void *)target.texture)
+               (__bridge void *)target.texture) : metal_frame_convert_sdr(frame, (__bridge void *)device,
+               (__bridge void *)buffer, md.context.frameSDRPipeline,
+               (__bridge void *)target.texture))
             : !metal_frame_copy(frame, (__bridge void *)device,
                (__bridge void *)buffer, (__bridge void *)target.texture))
          return VIDEO_TEXTURE_UPDATE_REFUSED;
@@ -10122,6 +10434,14 @@ static enum video_texture_update metal_import_texture(void *data, uintptr_t *han
 }
 /* METAL_FRAME_IMPORT_END */
 
+static enum video_texture_update metal_import_movie_frame(void *data,
+      const video_frame_import_t *frame)
+{
+   MetalDriver *md = (__bridge MetalDriver*)data;
+   if (!md || !md.frameView) return VIDEO_TEXTURE_UPDATE_REFUSED;
+   return [md.frameView importMovieFrame:frame];
+}
+
 static bool metal_get_device(void *data, video_device_info_t *info)
 {
    MetalDriver *md = (__bridge MetalDriver *)data;
@@ -10136,6 +10456,10 @@ static bool metal_get_device(void *data, video_device_info_t *info)
    info->get_instance_proc_addr  = NULL;
    info->queue_family           = 0;
    info->import_formats         = 0;
+#ifdef METAL_HEVC_DRIVER
+   if (metal_hevc_owns((__bridge void*)md))
+      info->import_formats = IMAGE_PIXFMT_NV12 | IMAGE_PIXFMT_P010;
+#endif
    return true;
 }
 
@@ -10193,7 +10517,10 @@ static const video_poke_interface_t metal_poke_interface = {
    metal_frame_mem_ready,
    metal_frame_mem_free,
    metal_get_device,
-   metal_import_texture
+   metal_import_texture,
+   NULL, /* get_last_present_sync */
+   NULL, /* record_read */
+   metal_import_movie_frame
 };
 
 static void metal_get_poke_interface(void *data,

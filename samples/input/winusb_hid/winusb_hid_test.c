@@ -3,8 +3,9 @@
  * stand-in for winusb.dll put in its table before it starts.
  *
  *   start       -> a DualShock 3 is started on the control pipe: its LED
- *                  report written, 0xF4 set, 0xF2 and 0xF5 read, as HID
- *                  class requests with the report's type and ID
+ *                  report written, 0xF2 and 0xF5 read, as HID class
+ *                  requests with the report's type and ID; 0xF4 is
+ *                  tried and refused, as a pad on USB refuses it
  *   poll        -> the newest report the reader has had is the pad's
  *                  state, taken without a call into the driver
  *   bluetooth   -> the address the pad connects to is feature 0xF5
@@ -40,6 +41,14 @@ bool input_autoconfigure_disconnect(unsigned port, const char *name)
    return true;
 }
 void input_pad_connect(unsigned port, input_device_driver_t *driver) { }
+/* the hid joypad driver's numbering: slot n is device n */
+int input_driver_hid_claim(const void *hid_data, unsigned slot,
+      const char *name, uint16_t vid, uint16_t pid) { return (int)slot; }
+int input_driver_hid_number(const void *hid_data, unsigned slot)
+{
+   return (int)slot;
+}
+void input_driver_hid_release(const void *hid_data, unsigned slot) { }
 
 /* ---- winusb.dll ---- */
 
@@ -88,6 +97,12 @@ static BOOL WINAPI f_control(void *usb, winusb_setup_packet_t s,
    if ((s.Value & 0xff) == 0xf5 && s.RequestType == 0x21)
       memcpy(bt_host, data + 2, 6);
    ctrl_len = len;
+   /* a DualShock 3 on USB stalls 0xF4, Bluetooth's start */
+   if (s.RequestType == 0x21 && s.Value == 0x03f4)
+   {
+      SetLastError(ERROR_GEN_FAILURE);
+      return FALSE;
+   }
    return TRUE;
 }
 
@@ -244,8 +259,21 @@ int main(void)
    CHECK(hid != NULL, "init failed");
    if (!hid)
       return 1;
+
+   /* held by another program: left to it, said once, taken when free */
+   {
+      HANDLE other = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0,
+            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+      CHECK(other != INVALID_HANDLE_VALUE, "the stand-in could not be held");
+      winusb_hid_open(hid, path, "USB\\VID_054C&PID_0268\\1", 0x054c, 0x0268);
+      winusb_hid_open(hid, path, "USB\\VID_054C&PID_0268\\1", 0x054c, 0x0268);
+      CHECK(!hid->devices && connected_port == -1 && hid->busy_count == 1,
+            "a pad another program has open was not left to it, once");
+      CloseHandle(other);
+   }
    winusb_hid_open(hid, path, "USB\\VID_054C&PID_0268\\1", 0x054c, 0x0268);
    CHECK(hid->devices && connected_port == 0, "the pad is not on port 1");
+   CHECK(hid->busy_count == 0, "the pad was still counted as held elsewhere");
    dev = hid->devices;
 
    /* start */
@@ -264,7 +292,7 @@ int main(void)
          f5++;
    }
    CHECK(led == 1, "the LED report for port 1 was not sent as SET_REPORT");
-   CHECK(f4 == 1, "0xF4 was not set");
+   CHECK(f4 == 1, "0xF4 was not tried");
    CHECK(f2 == 1 && f5 == 1, "0xF2 and 0xF5 were not read");
 
    /* the newest report is the state */

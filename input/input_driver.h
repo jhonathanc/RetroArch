@@ -1166,6 +1166,11 @@ bool input_bluetooth_host_address(uint8_t *addr, char *name, size_t len);
 
 /* The Bluetooth address a controller connects to, read and set where
  * its driver can (see input_device_driver_t's get_bt_host). */
+/* A device number for a pad of a source beside the joypad driver
+ * (input_device_pool.h), or -1; and giving it back. */
+int input_driver_device_claim(unsigned source, unsigned slot);
+void input_driver_device_release(unsigned source, unsigned slot);
+
 bool input_driver_get_bt_host(unsigned pad, uint8_t *addr);
 bool input_driver_set_bt_host(unsigned pad, const uint8_t *addr);
 bool input_config_get_android_disconnect_workaround(void);
@@ -1676,6 +1681,17 @@ const char* config_get_hid_driver_options(void);
  * @return HID driver if found, otherwise NULL.
  **/
 const hid_driver_t *input_hid_init_first(void);
+
+/* The device number a HID driver's pad in @slot is known by: the slot
+ * itself where the HID driver is the joypad driver's, a number from
+ * the shared pool where it is a source beside it; -1 when there is
+ * none. Released when the pad goes. */
+int input_driver_hid_claim(const void *hid_data, unsigned slot,
+      const char *name, uint16_t vid, uint16_t pid);
+int input_driver_hid_number(const void *hid_data, unsigned slot);
+void input_driver_hid_release(const void *hid_data, unsigned slot);
+/* A test's source beside the joypad driver, in place of the platform's. */
+void input_driver_beside_override(const hid_driver_t *drv);
 
 /**
  * Get a pointer to the HID driver data structure
@@ -2366,6 +2382,8 @@ size_t input_entry_target(unsigned number, char *s, size_t len);
  * second (0: at once); and set. */
 unsigned input_entry_hold(unsigned number);
 bool input_entry_set_hold(unsigned number, unsigned tenths);
+unsigned input_entry_depth(unsigned number);
+bool input_entry_set_depth(unsigned number, unsigned percent);
 size_t input_entry_spec(unsigned number, char *s, size_t len);
 /* The entries and macros written into a configuration to be saved. */
 void input_entries_write(void *conf);

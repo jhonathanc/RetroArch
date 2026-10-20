@@ -165,6 +165,7 @@
 #endif
 
 #include "input/input_remapping.h"
+#include "input/drivers_hid/winusb_bind.h"
 #ifdef HAVE_OPENXR
 #include "input/common/input_openxr.h"
 #include "gfx/video_xr.h"
@@ -1554,10 +1555,13 @@ static void driver_headset_notice(runloop_state_t *runloop_st,
 }
 #endif
 
+/* @audio_input, when set, receives the audio input rate instead of the
+ * audio driver: the caller hands it over itself. */
 static void driver_adjust_system_rates(
       runloop_state_t *runloop_st,
       video_driver_state_t *video_st,
-      settings_t *settings)
+      settings_t *settings,
+      double *audio_input)
 {
    double input_sample_rate               = video_st->av_info.timing.sample_rate;
    double input_fps                       = video_st->av_info.timing.fps;
@@ -1638,10 +1642,9 @@ static void driver_adjust_system_rates(
    if (input_sample_rate > 0.0)
    {
       audio_driver_state_t *audio_st      = audio_state_get_ptr();
-      if (sync_plan & RUNLOOP_SYNC_EXACT_RATE)
-         audio_st->input = input_sample_rate;
-      else
-         audio_st->input =
+      double input                        = input_sample_rate;
+      if (!(sync_plan & RUNLOOP_SYNC_EXACT_RATE))
+         input =
             audio_driver_monitor_adjust_system_rates(
                   input_sample_rate,
                   input_fps,
@@ -1651,8 +1654,12 @@ static void driver_adjust_system_rates(
                   shader_subframes,
                   audio_max_timing_skew);
 
-      RARCH_LOG("[Audio] Set audio input rate to: %.2f Hz.\n",
-            audio_st->input);
+      if (audio_input)
+         *audio_input    = input;
+      else
+         audio_st->input = input;
+
+      RARCH_LOG("[Audio] Set audio input rate to: %.2f Hz.\n", input);
    }
 
    runloop_st->flags &= ~RUNLOOP_FLAG_FORCE_NONBLOCK;
@@ -1678,6 +1685,14 @@ static void driver_adjust_system_rates(
 
    if (video_st->data)
       driver_set_nonblock_state();
+}
+
+bool driver_set_audio_input_rate(void)
+{
+   double input = 0.0;
+   driver_adjust_system_rates(runloop_state_get_ptr(), video_state_get_ptr(),
+         config_get_ptr(), &input);
+   return audio_driver_set_input_rate(input);
 }
 
 /**
@@ -1850,7 +1865,7 @@ void drivers_init(
 
    /* Adjust rates */
    if (flags & (DRIVER_VIDEO_MASK | DRIVER_AUDIO_MASK))
-      driver_adjust_system_rates(runloop_st, video_st, settings);
+      driver_adjust_system_rates(runloop_st, video_st, settings, NULL);
 
    /* Initialize audio driver */
    if (flags & DRIVER_AUDIO_MASK)
@@ -1858,6 +1873,7 @@ void drivers_init(
       audio_driver_init_internal(
             settings,
             audio_st->callback.callback != NULL);
+      audio_driver_drop_kept();
       /* Whether or not init succeeded: the list is how the user gets
        * out of a failed device choice. */
       audio_driver_refresh_devices_list();
@@ -2206,7 +2222,13 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
    }
 
    if (flags & DRIVER_AUDIO_MASK)
+   {
+      /* Content loaded or closed: the device is kept for drivers_init()
+       * to take back, when it would open the same one. */
+      audio_driver_keep_device(
+            (lifetime_flags & DRIVER_LIFETIME_SESSION_SWITCH) != 0);
       audio_driver_deinit();
+   }
 
    /* (a driver kept across the restart keeps its data) */
    if (     (flags & DRIVER_INPUT_MASK)
@@ -2373,7 +2395,7 @@ bool driver_ctl(enum driver_ctl_state state, void *data)
                   && runloop_st->current_core_type == CORE_TYPE_DUMMY)
                video_st->av_info.timing.fps = *hz;
 
-            driver_adjust_system_rates(runloop_st, video_st, settings);
+            driver_adjust_system_rates(runloop_st, video_st, settings, NULL);
 
             /* Use the input rate adjusted for the new display timing. */
             audio_st->src_ratio_orig   =
@@ -3720,6 +3742,34 @@ static void command_event_finish_content_deinit(void)
 
 }
 
+/* What the audio driver's teardown drops, put back once it is up again:
+ * the record that the core is held, the menu's entries, the system
+ * sounds the mixer lost. */
+static void retroarch_audio_restarted(runloop_state_t *runloop_st,
+      settings_t *settings)
+{
+   bool core_held = !!(runloop_st->flags & RUNLOOP_FLAG_PAUSED);
+#ifdef HAVE_MENU
+   struct menu_state *menu_st = menu_state_get_ptr();
+   if (     (menu_st->flags & MENU_ST_FLAG_ALIVE)
+         && settings->bools.menu_pause_libretro
+#ifdef HAVE_NETWORKING
+         && netplay_driver_ctl(RARCH_NETPLAY_CTL_ALLOW_PAUSE, NULL)
+#endif
+      )
+      core_held = true;
+#endif
+   (void)settings;
+   if (core_held)
+      audio_driver_pause_fade(true);
+#ifdef HAVE_MENU
+   menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+#endif
+#if defined(HAVE_AUDIOMIXER)
+   audio_driver_load_system_sounds();
+#endif
+}
+
 bool command_event(enum event_command cmd, void *data)
 {
    struct rarch_state *p_rarch     = &rarch_st;
@@ -4656,16 +4706,22 @@ bool command_event(enum event_command cmd, void *data)
          /* this fallthrough is on purpose, it should do
             a CMD_EVENT_REINIT too */
       case CMD_EVENT_REINIT:
-         command_event_reinit(
-               data ? *(const int*)data : DRIVERS_CMD_ALL);
-
+         {
+            int reinit_flags = data ? *(const int*)data : DRIVERS_CMD_ALL;
+            if (command_event_reinit(reinit_flags))
+            {
+               /* Audio started over with the rest; what its own
+                * reinit restores after the teardown, this does. */
+               if (reinit_flags & DRIVER_AUDIO_MASK)
+                  retroarch_audio_restarted(runloop_st, settings);
 #if defined(HAVE_AUDIOMIXER) && defined(HAVE_MENU)
-         /* Menu sounds require audio reinit. */
-         if (     settings->bools.audio_enable_menu
-               && (!data || (*(const int*)data
-                     & (DRIVER_AUDIO_MASK | DRIVER_MENU_MASK))))
-            command_event(CMD_EVENT_AUDIO_REINIT, NULL);
+               /* Menu sounds require audio reinit. */
+               else if (settings->bools.audio_enable_menu
+                     && (reinit_flags & DRIVER_MENU_MASK))
+                  command_event(CMD_EVENT_AUDIO_REINIT, NULL);
 #endif
+            }
+         }
 
          /* Recalibrate frame delay target if not pausing */
          if (settings->bools.video_frame_delay_auto && !video_st->frame_delay_pause)
@@ -5251,27 +5307,7 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_AUDIO_REINIT:
          driver_uninit(DRIVER_AUDIO_MASK, DRIVER_LIFETIME_RESET);
          drivers_init(settings, DRIVER_AUDIO_MASK, DRIVER_LIFETIME_RESET, verbosity_is_enabled());
-         /* The teardown drops the record that the core is held. */
-         {
-            bool core_held = !!(runloop_st->flags & RUNLOOP_FLAG_PAUSED);
-#ifdef HAVE_MENU
-            if (     (menu_st->flags & MENU_ST_FLAG_ALIVE)
-                  && settings->bools.menu_pause_libretro
-#ifdef HAVE_NETWORKING
-                  && netplay_driver_ctl(RARCH_NETPLAY_CTL_ALLOW_PAUSE, NULL)
-#endif
-               )
-               core_held = true;
-#endif
-            if (core_held)
-               audio_driver_pause_fade(true);
-         }
-#ifdef HAVE_MENU
-         menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
-#endif
-#if defined(HAVE_AUDIOMIXER)
-         audio_driver_load_system_sounds();
-#endif
+         retroarch_audio_restarted(runloop_st, settings);
          break;
 #ifdef HAVE_MICROPHONE
       case CMD_EVENT_MICROPHONE_REINIT:
@@ -7320,6 +7356,13 @@ extern "C"
 #endif
 int main(int argc, char *argv[])
 {
+#ifdef HAVE_WINUSB_BIND
+   /* the copy started with administrator rights to move a DualShock 3
+    * to WinUSB or back (winusb_bind_request()), or an installer's */
+   int ret;
+   if (argc == 2 && winusb_bind_command(argv[1], &ret))
+      return ret;
+#endif
    return rarch_main(argc, argv, NULL);
 }
 #endif

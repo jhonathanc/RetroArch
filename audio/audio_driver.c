@@ -1071,10 +1071,125 @@ static void audio_driver_pipe_marks_clear(audio_driver_state_t *audio_st)
 }
 #endif
 
+/* A device set aside across a content switch, and what it was opened
+ * with: the next init takes it back when it would open the same, and
+ * frees it otherwise. Stopped while it waits - the threaded wrapper
+ * parked, so its thread reads nothing that is rebuilt meanwhile. */
+static struct
+{
+   const audio_driver_t *driver;
+   void    *data;
+   char     ident[sizeof(((settings_t*)0)->arrays.audio_driver)];
+   char     device[sizeof(((settings_t*)0)->arrays.audio_device)];
+   size_t   device_latency_frames;
+   unsigned rate;
+   unsigned latency;
+   bool     wrapper;
+   bool     priority;
+   bool     fast_cores;
+   bool     requested;
+} audio_driver_kept;
+/* The latency the open device was asked for, and whether it was opened
+ * through the threaded wrapper. */
+static unsigned audio_driver_open_latency;
+static bool     audio_driver_open_wrapper;
+
+void audio_driver_keep_device(bool keep)
+{
+   audio_driver_kept.requested = keep;
+}
+
+void audio_driver_drop_kept(void)
+{
+   if (!audio_driver_kept.driver)
+      return;
+   if (audio_driver_kept.data && audio_driver_kept.driver->free)
+      audio_driver_kept.driver->free(audio_driver_kept.data);
+   audio_driver_kept.driver = NULL;
+   audio_driver_kept.data   = NULL;
+}
+
+/* At teardown: sets the device aside if asked to and it can be. */
+static bool audio_driver_set_aside(audio_driver_state_t *audio_st,
+      const audio_driver_t *audio)
+{
+   settings_t *settings = config_get_ptr();
+   const char *env      = getenv("RETROARCH_AUDIO_KEEP");
+   bool keep            = audio_driver_kept.requested;
+
+   audio_driver_kept.requested = false;
+   if (     !keep
+         || (env && env[0] == '0')
+         || !audio->stop
+         || !audio->start
+#ifdef HAVE_THREADS
+         || (     audio_st->pipe_threaded
+               && retro_atomic_load_acquire_int(
+                     &audio_st->pipe_consumer_gone))
+#endif
+         )
+      return false;
+   if (!audio->stop(audio_st->context_audio_data))
+      return false;
+
+   audio_driver_kept.driver                = audio;
+   audio_driver_kept.data                  = audio_st->context_audio_data;
+   audio_driver_kept.device_latency_frames = audio_st->device_latency_frames;
+   audio_driver_kept.rate       = settings->uints.audio_output_sample_rate;
+   audio_driver_kept.latency    = audio_driver_open_latency;
+   audio_driver_kept.wrapper    = audio_driver_open_wrapper;
+   audio_driver_kept.priority   = settings->bools.audio_thread_priority;
+   audio_driver_kept.fast_cores = settings->bools.thread_prefer_fast_cores;
+   strlcpy(audio_driver_kept.ident, settings->arrays.audio_driver,
+         sizeof(audio_driver_kept.ident));
+   strlcpy(audio_driver_kept.device, settings->arrays.audio_device,
+         sizeof(audio_driver_kept.device));
+   RARCH_LOG("[Audio] Driver \"%s\" kept across the content switch.\n",
+         audio->ident);
+   return true;
+}
+
+/* At init, in place of opening one: the kept device, if it is what
+ * would be opened. A synchronous device comes back running, as from
+ * its init; the wrapper parked, as from its own, for init's start. */
+static bool audio_driver_take_kept(audio_driver_state_t *audio_st,
+      const settings_t *settings, unsigned latency, bool wrapper)
+{
+   if (!audio_driver_kept.driver)
+      return false;
+   if (     wrapper != audio_driver_kept.wrapper
+         || latency != audio_driver_kept.latency
+         || settings->uints.audio_output_sample_rate != audio_driver_kept.rate
+         || !string_is_equal(settings->arrays.audio_driver, audio_driver_kept.ident)
+         || !string_is_equal(settings->arrays.audio_device, audio_driver_kept.device)
+         || (wrapper
+            && (     settings->bools.audio_thread_priority    != audio_driver_kept.priority
+                  || settings->bools.thread_prefer_fast_cores != audio_driver_kept.fast_cores)))
+   {
+      RARCH_LOG("[Audio] The kept driver does not match the new settings; opening another.\n");
+      audio_driver_drop_kept();
+      return false;
+   }
+
+   audio_st->current_audio         = audio_driver_kept.driver;
+   audio_st->context_audio_data    = audio_driver_kept.data;
+   audio_st->device_latency_frames = audio_driver_kept.device_latency_frames;
+   audio_driver_kept.driver        = NULL;
+   audio_driver_kept.data          = NULL;
+   if (!wrapper)
+      audio_st->current_audio->start(audio_st->context_audio_data, false);
+   RARCH_LOG("[Audio] Kept driver \"%s\" taken back; the device stays open.\n",
+         audio_st->current_audio->ident);
+   return true;
+}
+
 static bool audio_driver_deinit_internal(bool audio_enable)
 {
    audio_driver_state_t *audio_st = &audio_driver_st;
    const audio_driver_t *audio    = audio_st->current_audio;
+
+   /* One set aside before and not taken back is not wanted. */
+   audio_driver_drop_kept();
 
    /* Drop the flags that observers gate on before the context and the
     * scratch buffers go away, so a flush that races this teardown bails
@@ -1109,10 +1224,12 @@ static bool audio_driver_deinit_internal(bool audio_enable)
                audio_st->input > 0.0f ? (double)low * 1000.0 / (double)audio_st->input : 0.0);
       }
 #endif
-      if (audio_st->context_audio_data)
+      if (     audio_st->context_audio_data
+            && !audio_driver_set_aside(audio_st, audio))
          audio->free(audio_st->context_audio_data);
       audio_st->context_audio_data = NULL;
    }
+   audio_driver_kept.requested = false;
 
    audio_st->pipe_pending = NULL;
    audio_st->pipe_pending_bytes = 0;
@@ -4332,6 +4449,37 @@ static bool audio_driver_inline_prepare(audio_driver_state_t *audio_st,
 
 static bool audio_driver_transport_configure(const settings_t *settings);
 
+#ifdef HAVE_THREADS
+/* Frames of core audio at @input the threaded pipeline's ring has to
+ * hold, and in @pass_frames the consumer's pass: a video frame's worth,
+ * capped to a slice. fps comes from the av_info @input was derived
+ * from. */
+static size_t audio_driver_pipe_ring_frames(double input, bool audio_sync,
+      unsigned latency, size_t *pass_frames)
+{
+   double fps       = video_state_get_ptr()->av_info.timing.fps;
+   size_t per_frame = (fps > 0.0) ? (size_t)(input / fps) : 1024;
+   size_t frames    = per_frame * AUDIO_PIPE_RING_FRAMES;
+   /* With a non-blocking writer the ring holds a buffer's worth on
+    * purpose - see audio_driver_pipe_target_frames() - on top of
+    * the frames it holds for the pass; the setting says how much
+    * that is, before the driver has said what it made of it. */
+   if (!audio_sync)
+   {
+      size_t latency_frames = (size_t)(input * latency / 1000.0);
+      if (latency_frames < per_frame)
+         latency_frames = per_frame;
+      frames       += latency_frames * 2;
+   }
+   if (per_frame > AUDIO_PIPE_SLICE_INT16S / 2)
+      per_frame     = AUDIO_PIPE_SLICE_INT16S / 2;
+   if (per_frame < 64)
+      per_frame     = 64;
+   *pass_frames     = per_frame;
+   return frames;
+}
+#endif
+
 bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
 {
    unsigned new_rate              = 0;
@@ -4388,6 +4536,14 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
          i16_total * sizeof(int16_t));
    float *arena_float             = (float*)memalign_alloc(64,
          f32_total * sizeof(float));
+
+   /* An instance already up goes first, as driver_uninit() would take
+    * it: one overwritten here is never freed, and on the threaded
+    * pipeline its thread goes on consuming the ring beside the new
+    * one's. A core that sends SET_SYSTEM_AV_INFO from retro_load_game
+    * has audio brought up by that reinit and again by drivers_init(). */
+   if (audio_driver_st.context_audio_data)
+      audio_driver_deinit();
 
    convert_s16_to_float_init_simd();
    convert_float_to_s16_init_simd();
@@ -4493,25 +4649,13 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
          && !audio_cb_inited
          && audio_driver_st.current_audio->wait_writable)
    {
-      /* Capacity in bytes of int16 stereo frames at the core's rate.
-       * audio_driver_st.input is already set by the caller
-       * (driver_adjust_system_rates); fps comes from the same av_info. */
-      double fps       = video_state_get_ptr()->av_info.timing.fps;
-      size_t per_frame = (fps > 0.0)
-            ? (size_t)(audio_driver_st.input / fps) : 1024;
-      size_t frames    = per_frame * AUDIO_PIPE_RING_FRAMES;
+      /* audio_driver_st.input is already set by the caller
+       * (driver_adjust_system_rates). */
+      size_t pass_frames;
+      size_t frames    = audio_driver_pipe_ring_frames(audio_driver_st.input,
+            audio_sync, audio_latency, &pass_frames);
       size_t bytes;
-      /* With a non-blocking writer the ring holds a buffer's worth on
-       * purpose - see audio_driver_pipe_target_frames() - on top of
-       * the frames it holds for the pass; the setting says how much
-       * that is, before the driver has said what it made of it. */
-      if (!settings->bools.audio_sync)
-      {
-         size_t latency_frames = (size_t)(audio_driver_st.input * audio_latency / 1000.0);
-         if (latency_frames < per_frame)
-            latency_frames = per_frame;
-         frames       += latency_frames * 2;
-      }
+      audio_driver_st.pipe_latency     = audio_latency;
       audio_driver_st.pipe_float       = audio_driver_st.core_float;
       /* a multi-channel core's ring carries the canonical wide frame */
       audio_driver_st.pipe_channels    = audio_driver_st.core_multi
@@ -4529,11 +4673,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
          return false;
       }
       audio_driver_pipe_marks_clear(&audio_driver_st);
-      audio_driver_st.pipe_pass_frames    = per_frame;
-      if (audio_driver_st.pipe_pass_frames > AUDIO_PIPE_SLICE_INT16S / 2)
-         audio_driver_st.pipe_pass_frames = AUDIO_PIPE_SLICE_INT16S / 2;
-      if (audio_driver_st.pipe_pass_frames < 64)
-         audio_driver_st.pipe_pass_frames = 64;
+      audio_driver_st.pipe_pass_frames    = pass_frames;
       /* A pass of the widest frame for the consumer's front split and
        * parked write tail, and the producer's staging, whichever format
        * the ring carries. */
@@ -4583,12 +4723,20 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
             (unsigned)(audio_driver_st.pipe_ring.capacity / audio_driver_st.pipe_frame_bytes),
             audio_driver_st.pipe_float ? "float" : "int16");
    }
+#endif
 
    /* Before the driver's init, which is where a driver that reports a
     * device stage sets it. */
    audio_driver_st.device_latency_frames = 0;
 
-   if (audio_cb_inited || (AUDIO_FLAGS_GET(&audio_driver_st) & AUDIO_FLAG_PIPELINE_THREADED))
+   audio_driver_open_latency = audio_latency;
+   audio_driver_open_wrapper = audio_cb_inited
+      || (AUDIO_FLAGS_GET(&audio_driver_st) & AUDIO_FLAG_PIPELINE_THREADED);
+   if (audio_driver_take_kept(&audio_driver_st, settings, audio_latency,
+            audio_driver_open_wrapper))
+      ;
+#ifdef HAVE_THREADS
+   else if (audio_cb_inited || (AUDIO_FLAGS_GET(&audio_driver_st) & AUDIO_FLAG_PIPELINE_THREADED))
    {
       RARCH_LOG("[Audio] Starting threaded audio driver...\n");
       if (!audio_init_thread(
@@ -9223,6 +9371,177 @@ static void audio_driver_pipe_set_format(void *userdata)
    }
 }
 #endif
+
+/* The resamplers for the new ratio go in; the old ones come back out
+ * to be freed once the consumer no longer runs them. */
+struct audio_driver_rate_change
+{
+   double ratio;
+   const retro_resampler_t *resampler;
+   void *resampler_data;
+   retro_resampler_int16_t res16;
+   size_t pass_frames;
+   size_t ring_bytes;
+   float input;
+   bool hq;
+   bool swap;    /* false: the rate holds, only the ring and slice follow */
+   bool applied;
+};
+
+static void audio_driver_rate_apply(void *userdata)
+{
+   struct audio_driver_rate_change *change =
+         (struct audio_driver_rate_change*)userdata;
+   audio_driver_state_t *audio_st         = &audio_driver_st;
+   const retro_resampler_t *resampler     = audio_st->resampler;
+   void *resampler_data                   = audio_st->resampler_data;
+   retro_resampler_int16_t res16;
+
+   /* Consumer state: read only while it is parked. */
+   change->applied = !audio_st->extra.nres
+#ifdef HAVE_THREADS
+      && !audio_st->pipe_transport
+      && !audio_st->pipe_transport_suspended
+      && (!audio_st->pipe_threaded
+         || retro_spsc_grow(&audio_st->pipe_ring, change->ring_bytes))
+#endif
+      ;
+   if (!change->applied)
+      return;
+#ifdef HAVE_THREADS
+   if (audio_st->pipe_threaded)
+      audio_st->pipe_pass_frames     = change->pass_frames;
+#endif
+   if (!change->swap)
+      return;
+
+   res16.data    = audio_st->resampler_data_int16;
+   res16.process = audio_st->resampler_int16_process;
+   res16.reset   = audio_st->resampler_int16_reset;
+   res16.free    = audio_st->resampler_int16_free;
+   res16.sibling = audio_st->resampler_int16_sibling;
+
+   audio_st->input                   = change->input;
+   audio_st->src_ratio_orig          = change->ratio;
+   audio_st->src_ratio_curr          = change->ratio;
+   audio_st->resampler               = change->resampler;
+   audio_st->resampler_data          = change->resampler_data;
+   audio_st->resampler_hq            = change->hq;
+   audio_st->resampler_bypassed      = false;
+   if (res16.data)
+   {
+      audio_st->resampler_data_int16    = change->res16.data;
+      audio_st->resampler_int16_process = change->res16.process;
+      audio_st->resampler_int16_reset   = change->res16.reset;
+      audio_st->resampler_int16_free    = change->res16.free;
+      audio_st->resampler_int16_sibling = change->res16.sibling;
+   }
+   /* The sink estimate's windows are in the old ratio. */
+   audio_st->sink_bias               = 1.0;
+   retro_atomic_store_release_int(&audio_st->sink_bias_q, 0);
+   audio_st->sink_started            = 0;
+   audio_st->sink_offered            = 0.0;
+   audio_st->sink_offered_raw        = 0;
+   audio_st->sink_accepted           = 0;
+   audio_st->sink_applied            = 0;
+   audio_st->sink_rate_hz            = 0.0;
+   audio_st->sink_source_hz          = 0.0;
+   audio_driver_update_drc_threshold(audio_st);
+
+   change->resampler      = resampler;
+   change->resampler_data = resampler_data;
+   change->res16          = res16;
+}
+
+bool audio_driver_set_input_rate(double input)
+{
+   struct audio_driver_rate_change change;
+   audio_driver_state_t *audio_st = &audio_driver_st;
+   settings_t *settings           = config_get_ptr();
+
+   if (!(input > 0.0))
+      return false;
+   if (     !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
+         || !audio_st->context_audio_data
+         || !audio_st->resampler_data
+         || audio_st->callback.callback
+         || audio_st->inline_transport
+#ifdef HAVE_DSP_FILTER
+         || audio_st->dsp
+#endif
+         || settings->bools.audio_time_stretch
+         || settings->bools.audio_time_stretch_lowpass)
+      return false;
+   change.input       = (float)input;
+   change.ratio       = (double)audio_st->out_rate / change.input;
+   change.swap        = change.input != audio_st->input;
+   change.hq          = false;
+   change.pass_frames = 0;
+   change.ring_bytes  = 0;
+   change.resampler      = NULL;
+   change.resampler_data = NULL;
+   memset(&change.res16, 0, sizeof(change.res16));
+#ifdef HAVE_THREADS
+   /* Sized in video frames, so a new frame rate moves them too. */
+   if (audio_st->pipe_threaded)
+      change.ring_bytes = audio_driver_pipe_ring_frames(change.input,
+            settings->bools.audio_sync, audio_st->pipe_latency,
+            &change.pass_frames) * audio_st->pipe_frame_bytes;
+   if (     !change.swap
+         && (     !audio_st->pipe_threaded
+               || (     change.pass_frames == audio_st->pipe_pass_frames
+                     && change.ring_bytes  <= audio_st->pipe_ring.capacity)))
+      return true;
+#else
+   if (!change.swap)
+      return true;
+#endif
+   if (!change.swap)
+      goto apply;
+
+   if (!retro_resampler_realloc_hq(&change.resampler_data, &change.resampler,
+            audio_st->resampler_ident, audio_st->resampler_quality,
+            change.ratio, settings->bools.audio_resampler_hq_oversampling))
+      return false;
+   change.hq = settings->bools.audio_resampler_hq_oversampling
+      && change.ratio >= 2.0
+      && change.resampler
+      && (change.resampler->caps & RESAMPLER_CAP_HQ_OVERSAMPLE);
+
+   if (audio_st->resampler_data_int16)
+   {
+      retro_resampler_int16_new(&change.res16, change.resampler->short_ident,
+            audio_st->resampler_quality, change.ratio, change.hq);
+      if (!change.res16.data)
+      {
+         change.resampler->free(change.resampler_data);
+         return false;
+      }
+   }
+
+apply:
+#ifdef HAVE_THREADS
+   if (     audio_st->pipe_threaded
+         && audio_st->current_audio
+         && string_is_equal(audio_st->current_audio->ident, "audio-thread"))
+      audio_thread_apply_control(audio_st->context_audio_data,
+            audio_driver_rate_apply, &change);
+   else
+#endif
+      audio_driver_rate_apply(&change);
+
+   if (change.resampler && change.resampler_data)
+      change.resampler->free(change.resampler_data);
+   if (change.res16.data && change.res16.free)
+      change.res16.free(change.res16.data);
+   if (!change.applied)
+      return false;
+
+   if (change.swap)
+      RARCH_LOG("[Audio] Input rate changed to %.2f Hz; the driver keeps running.\n",
+            input);
+   return true;
+}
 
 void audio_driver_set_core_float(bool core_float)
 {

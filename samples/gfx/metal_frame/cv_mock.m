@@ -146,6 +146,7 @@ static void test_cv_color_mock(void)
 static void test_cv_mock(void)
 {
    unsigned format, action;
+   test_cv_pool_setup();
    for (format = 1; format <= 4; format++) for (action = 0; action < 8; action++)
    {
       @autoreleasepool
@@ -161,6 +162,9 @@ static void test_cv_mock(void)
          unsigned range = format == 2 || format == 4 ? 2 : 1;
          memset(&source, 0, sizeof(source));
          pixels->format = format;
+         if (!action)
+            test_cv_pool(device, device, pixels,
+                  format <= 2 ? IMAGE_PIXFMT_NV12 : IMAGE_PIXFMT_P010, 10, 8);
          source.device = device; source.ready = ready; source.done = done; source.listener = listener;
          source.ready_value = 3; source.done_value = 7;
          source.width = 7; source.height = 5; source.crop_x = 2; source.crop_y = 2;

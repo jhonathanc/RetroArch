@@ -37,6 +37,7 @@
 #include <retro_atomic.h>
 #include <retro_miscellaneous.h>
 #include <rthreads/rthreads.h>
+#include <features/features_cpu.h>
 
 #include "../connect/joypad_connection.h"
 #include "../input_defines.h"
@@ -125,12 +126,27 @@ typedef struct winusb_device
    int read_idx;    /* the frontend's */
    retro_atomic_int_t quit;
    retro_atomic_int_t gone;
+   /* for the log when the pad goes: the reader's, read after the join */
+   unsigned reports;
+   unsigned unseen;       /* replaced before the poll took them */
+   retro_time_t gap_max;  /* longest wait between two reports */
+   retro_time_t last;
+   /* the poll's */
+   unsigned taken;
 } winusb_device_t;
+
+/* pads another program has open: WinUSB lets one program at a time
+ * have a device, so one held elsewhere (ScpToolkit, an SDL with
+ * libusb) is left to it, said once, and tried again at each rescan */
+#define WINUSB_BUSY_MAX 4
 
 typedef struct winusb_hid
 {
    joypad_connection_t *slots;
    winusb_device_t *devices;
+   char busy[WINUSB_BUSY_MAX][MAX_PATH];
+   unsigned busy_count;
+   unsigned busy_seen; /* bit n: busy[n] was there at this scan */
    HMODULE cfgmgr;
    winusb_cm_unregister_t cm_unregister;
    HANDLE notification;
@@ -224,6 +240,9 @@ static void winusb_hid_reader(void *data)
    }
    events[0] = dev->quit_event;
    events[1] = ov.hEvent;
+   /* as the main, video and audio threads are: a report waiting
+    * behind them is a press or release seen late */
+   sthread_raise_current_priority();
 
    while (!retro_atomic_load_acquire_int(&dev->quit))
    {
@@ -253,9 +272,18 @@ static void winusb_hid_reader(void *data)
       }
       if (got)
       {
+         int old;
+         retro_time_t now = cpu_features_get_time_usec();
          dev->len[w]    = got;
-         dev->write_idx = retro_atomic_exchange_int(&dev->middle,
-               w | WINUSB_FRESH) & 3;
+         old            = retro_atomic_exchange_int(&dev->middle,
+               w | WINUSB_FRESH);
+         dev->write_idx = old & 3;
+         dev->reports++;
+         if (old & WINUSB_FRESH)
+            dev->unseen++;
+         if (dev->last && now - dev->last > dev->gap_max)
+            dev->gap_max = now - dev->last;
+         dev->last = now;
       }
    }
    CloseHandle(ov.hEvent);
@@ -268,6 +296,10 @@ static void winusb_hid_close(winusb_device_t *dev)
       retro_atomic_store_release_int(&dev->quit, 1);
       SetEvent(dev->quit_event);
       sthread_join(dev->reader);
+      RARCH_DBG("[WinUSB] \"%s\": %u reports, %u taken by the poll, %u replaced"
+            " before it took them; %u ms at most between two.\n",
+            dev->name, dev->reports, dev->taken, dev->unseen,
+            (unsigned)(dev->gap_max / 1000));
    }
    if (dev->usb)
       winusb_api.Free(dev->usb);
@@ -292,9 +324,33 @@ static winusb_device_t *winusb_hid_find(winusb_hid_t *hid,
 
 /* A pad's interface opened, its reader started and its handler given
  * it. */
+static int winusb_hid_busy_find(winusb_hid_t *hid, const char *instance)
+{
+   unsigned i;
+   for (i = 0; i < hid->busy_count; i++)
+      if (string_is_equal(hid->busy[i], instance))
+         return (int)i;
+   return -1;
+}
+
+static void winusb_hid_busy_drop(winusb_hid_t *hid, unsigned i)
+{
+   unsigned last = --hid->busy_count;
+   if (i != last)
+   {
+      memcpy(hid->busy[i], hid->busy[last], sizeof(hid->busy[i]));
+      if (hid->busy_seen & (1u << last))
+         hid->busy_seen |= (1u << i);
+      else
+         hid->busy_seen &= ~(1u << i);
+   }
+   hid->busy_seen &= ~(1u << last);
+}
+
 static void winusb_hid_open(winusb_hid_t *hid, const char *path,
       const char *instance, uint16_t vid, uint16_t pid)
 {
+   int number;
    winusb_device_t *dev;
 
    if (winusb_hid_find(hid, instance))
@@ -318,10 +374,29 @@ static void winusb_hid_open(winusb_hid_t *hid, const char *path,
          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
    if (dev->file == INVALID_HANDLE_VALUE)
    {
-      RARCH_WARN("[WinUSB] %s cannot be opened (error %lu).\n",
-            path, (unsigned long)GetLastError());
+      DWORD err = GetLastError();
+      if (err == ERROR_ACCESS_DENIED || err == ERROR_SHARING_VIOLATION)
+      {
+         if (     winusb_hid_busy_find(hid, instance) < 0
+               && hid->busy_count < WINUSB_BUSY_MAX)
+         {
+            strlcpy(hid->busy[hid->busy_count++], instance,
+                  sizeof(hid->busy[0]));
+            RARCH_LOG("[WinUSB] \"%s\" (%s) is in use by another"
+                  " program; it is left to that one.\n",
+                  dev->name, instance);
+         }
+      }
+      else
+         RARCH_WARN("[WinUSB] %s cannot be opened (error %lu).\n",
+               path, (unsigned long)err);
       free(dev);
       return;
+   }
+   {
+      int busy = winusb_hid_busy_find(hid, instance);
+      if (busy >= 0)
+         winusb_hid_busy_drop(hid, (unsigned)busy);
    }
    if (     !(dev->ctrl_event = CreateEventA(NULL, TRUE, FALSE, NULL))
          || !(dev->quit_event = CreateEventA(NULL, TRUE, FALSE, NULL))
@@ -352,15 +427,27 @@ static void winusb_hid_open(winusb_hid_t *hid, const char *path,
       return;
    }
 
+   /* its device number: its slot where this is the joypad driver's,
+    * one from the frontend's pool where it is beside another */
+   if ((number = input_driver_hid_claim(hid, (unsigned)dev->slot,
+               dev->name, vid, pid)) < 0)
+   {
+      RARCH_WARN("[WinUSB] \"%s\": no device number left.\n", dev->name);
+      pad_connection_pad_deinit(&hid->slots[dev->slot], dev->slot);
+      winusb_hid_close(dev);
+      return;
+   }
+
    dev->next    = hid->devices;
    hid->devices = dev;
-   RARCH_LOG("[WinUSB] \"%s\" on port %d.\n", dev->name, dev->slot + 1);
+   RARCH_LOG("[WinUSB] \"%s\" is device %d.\n", dev->name, number + 1);
    input_autoconfigure_connect(dev->name, NULL, NULL, "hid",
-         dev->slot, vid, pid);
+         (unsigned)number, vid, pid);
 }
 
 static void winusb_hid_remove(winusb_hid_t *hid, winusb_device_t *dev)
 {
+   int number;
    winusb_device_t **link;
 
    for (link = &hid->devices; *link; link = &(*link)->next)
@@ -368,7 +455,9 @@ static void winusb_hid_remove(winusb_hid_t *hid, winusb_device_t *dev)
       if (*link != dev)
          continue;
       *link = dev->next;
-      input_autoconfigure_disconnect(dev->slot, dev->name);
+      if ((number = input_driver_hid_number(hid, (unsigned)dev->slot)) >= 0)
+         input_autoconfigure_disconnect((unsigned)number, dev->name);
+      input_driver_hid_release(hid, (unsigned)dev->slot);
       pad_connection_pad_deinit(&hid->slots[dev->slot], dev->slot);
       winusb_hid_close(dev);
       return;
@@ -480,6 +569,7 @@ static void winusb_hid_scan(winusb_hid_t *hid)
 
    if (devs == INVALID_HANDLE_VALUE)
       return;
+   hid->busy_seen = 0;
    for (i = 0; ; i++)
    {
       SP_DEVINFO_DATA info;
@@ -506,11 +596,20 @@ static void winusb_hid_scan(winusb_hid_t *hid)
          RARCH_LOG("[WinUSB] %s is not bound to WinUSB.\n", instance);
          continue;
       }
+      {
+         int busy = winusb_hid_busy_find(hid, instance);
+         if (busy >= 0)
+            hid->busy_seen |= (1u << busy);
+      }
       if (winusb_hid_interface_path(devs, &info, instance,
                path, sizeof(path)))
          winusb_hid_open(hid, path, instance, (uint16_t)vid, (uint16_t)pid);
    }
    SetupDiDestroyDeviceInfoList(devs);
+   /* one unplugged while held elsewhere is said again when it is back */
+   for (i = hid->busy_count; i-- > 0; )
+      if (!(hid->busy_seen & (1u << i)))
+         winusb_hid_busy_drop(hid, (unsigned)i);
 }
 
 static DWORD CALLBACK winusb_hid_notified(HANDLE notification,
@@ -597,6 +696,7 @@ static void winusb_hid_poll(void *data)
       {
          dev->read_idx = retro_atomic_exchange_int(&dev->middle,
                dev->read_idx) & 3;
+         dev->taken++;
          pad_connection_packet(&hid->slots[dev->slot], dev->slot,
                dev->buf[dev->read_idx], (uint32_t)dev->len[dev->read_idx]);
       }

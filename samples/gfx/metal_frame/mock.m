@@ -10,8 +10,9 @@ static CFTypeRef CFRetain(CFTypeRef value) { return [(id)value retain]; }
 static void CFRelease(CFTypeRef value) { [(id)value release]; }
 typedef enum { MTLPixelFormatInvalid, MTLPixelFormatBGRA8Unorm,
    MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA16Float, MTLPixelFormatR8Unorm,
-   MTLPixelFormatRG8Unorm, MTLPixelFormatR16Unorm, MTLPixelFormatRG16Unorm } MTLPixelFormat;
-enum { MTLTextureUsageShaderRead = 1, MTLTextureUsageShaderWrite = 2 };
+   MTLPixelFormatRG8Unorm, MTLPixelFormatR16Unorm, MTLPixelFormatRG16Unorm,
+   MTLPixelFormatBGR10A2Unorm } MTLPixelFormat;
+enum { MTLTextureUsageShaderRead = 1, MTLTextureUsageShaderWrite = 2, MTLTextureUsageRenderTarget = 4 };
 enum { MTLTextureType2D = 2, MTLCommandBufferStatusNotEnqueued = 0,
    MTLCommandBufferStatusEnqueued = 1, MTLCommandBufferStatusCompleted = 4,
    MTLCommandBufferStatusError = 5 };
@@ -21,8 +22,11 @@ static MTLOrigin MTLOriginMake(NSUInteger x, NSUInteger y, NSUInteger z)
 { MTLOrigin result = {x, y, z}; return result; }
 static MTLSize MTLSizeMake(NSUInteger x, NSUInteger y, NSUInteger z)
 { MTLSize result = {x, y, z}; return result; }
-@protocol MTLDevice <NSObject> @end
 @protocol MTLTexture;
+@class MTLTextureDescriptor;
+@protocol MTLDevice <NSObject>
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor*)descriptor;
+@end
 @protocol MTLBlitCommandEncoder <NSObject>
 - (void)copyFromTexture:(id<MTLTexture>)source sourceSlice:(NSUInteger)slice
    sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)origin sourceSize:(MTLSize)size
@@ -46,8 +50,9 @@ static MTLSize MTLSizeMake(NSUInteger x, NSUInteger y, NSUInteger z)
 @interface MTLSharedEventListener : NSObject @end
 @implementation MTLSharedEventListener @end
 static unsigned live_textures, live_backing;
-@interface MockDevice : NSObject <MTLDevice> @end
-@implementation MockDevice @end
+@interface MockDevice : NSObject <MTLDevice>
+{ @public BOOL fail_alloc; }
+@end
 @interface MockTexture : NSObject <MTLTexture>
 {
 @public
@@ -70,6 +75,38 @@ static unsigned live_textures, live_backing;
 - (NSUInteger)width { return _width; }
 - (NSUInteger)height { return _height; }
 - (MTLPixelFormat)pixelFormat { return _pixelFormat; }
+@end
+@interface MTLTextureDescriptor : NSObject
+{
+   NSUInteger _width, _height, _usage;
+   MTLPixelFormat _pixelFormat;
+}
+@property(nonatomic) NSUInteger width, height, usage;
+@property(nonatomic) MTLPixelFormat pixelFormat;
++ (id)texture2DDescriptorWithPixelFormat:(MTLPixelFormat)format
+      width:(NSUInteger)width height:(NSUInteger)height mipmapped:(BOOL)mipmapped;
+@end
+@implementation MTLTextureDescriptor
+@synthesize width = _width, height = _height, usage = _usage, pixelFormat = _pixelFormat;
++ (id)texture2DDescriptorWithPixelFormat:(MTLPixelFormat)format
+      width:(NSUInteger)w height:(NSUInteger)h mipmapped:(BOOL)mipmapped
+{
+   MTLTextureDescriptor *descriptor = [[self new] autorelease];
+   (void)mipmapped;
+   descriptor.width = w; descriptor.height = h; descriptor.pixelFormat = format;
+   return descriptor;
+}
+@end
+@implementation MockDevice
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor*)descriptor
+{
+   if (fail_alloc) return nil;
+   MockTexture *texture = [MockTexture new];
+   texture->_device = [self retain]; texture->_width = descriptor.width;
+   texture->_height = descriptor.height; texture->_usage = descriptor.usage;
+   texture->_pixelFormat = descriptor.pixelFormat;
+   return texture;
+}
 @end
 @interface MockBacking : NSObject @end
 @implementation MockBacking
@@ -223,12 +260,14 @@ static id mock_compute_encoder(MockBuffer *buffer);
 @property(readonly) id<MTLCommandBuffer> blitCommandBuffer;
 @property(readonly) BOOL hdrEnabled;
 @property(readonly) void *frameSDRPipeline;
+@property(readonly) BOOL movieHDRSupported;
 - (id)linearShader;
 - (Texture *)newImportedTexture:(MTLPixelFormat)format width:(unsigned)width
       height:(unsigned)height filter:(enum texture_filter_type)filter;
 @end
 @implementation MockContext
 - (void *)frameSDRPipeline { return _frameSDRPipeline; }
+- (BOOL)movieHDRSupported { return !disable_hdr; }
 - (BOOL)hdrEnabled { return !disable_hdr; }
 - (id)linearShader { return disable_hdr ? nil : self; }
 - (id<MTLDevice>)device { return _device; }
@@ -259,6 +298,7 @@ static id mock_compute_encoder(MockBuffer *buffer);
 @end
 /* SHIPPING_IMPORT */
 /* SDR_IMPORT_TEST */
+/* MOVIE_IMPORT_TEST */
 
 static bool refuse_encode(void *user, const metal_frame_view_t *view, void *buffer)
 { (void)user; (void)view; (void)buffer; return false; }
@@ -545,6 +585,7 @@ int main(void)
 {
    test_sdr_mock();
    test_sdr_import_mock();
+   test_movie_import_mock();
    test_cv_mock();
    test_cv_color_mock();
    unsigned i, j;

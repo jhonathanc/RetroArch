@@ -87,6 +87,7 @@
 #include <queues/task_queue.h>
 #include "../../../core.h"
 #include <file/file_path.h>
+#include <string/stdstring.h>
 #include <boolean.h>
 #include <features/features_cpu.h>
 #include <time/rtime.h>
@@ -105,6 +106,7 @@
 #include "../../../verbosity.h"
 #include "../../../frontend/frontend_driver.h"
 #include "../../../gfx/video_driver.h"
+#include "../../../audio/audio_driver.h"
 #include "../../../input/input_driver.h"
 #include "../../../input/input_registry.h"
 #include "../../../input/input_remapping.h"
@@ -2198,6 +2200,143 @@ static unsigned pressure_frame(uint32_t buttons, int a2, int a3,
                   | (1u << RETRO_DEVICE_ID_JOYPAD_B));
 }
 #endif
+
+
+#ifdef HAVE_HID
+/* A source beside the joypad driver, stood in for: one pad, in its
+ * slot 0, whose buttons are beside_buttons. */
+static uint32_t beside_buttons;
+static int beside_init_number = -2;
+
+/* a pad already there is found in init, as WinUSB's are */
+static void *beside_init(void)
+{
+   beside_init_number = input_driver_hid_claim(&beside_buttons, 0,
+         "Beside Pad", 0x1234, 0x5678);
+   return &beside_buttons;
+}
+static void beside_free(const void *data) { (void)data; }
+static bool beside_query(void *data, unsigned pad) { return pad < 16; }
+static int16_t beside_button(void *data, unsigned pad, uint16_t key)
+{
+   return pad == 0 && key < 32 && ((beside_buttons >> key) & 1);
+}
+static void beside_get_buttons(void *data, unsigned pad, input_bits_t *state)
+{
+   BIT256_CLEAR_ALL_PTR(state);
+   if (pad == 0)
+      BITS_COPY32_PTR(state, beside_buttons);
+}
+static int16_t beside_axis(void *data, unsigned pad, uint32_t axis) { return 0; }
+static int16_t beside_state(void *data, rarch_joypad_info_t *info,
+      const uint16_t *joykeys, const uint32_t *joyaxes, unsigned port)
+{
+   unsigned i;
+   int16_t ret = 0;
+   for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
+      if (joykeys[i] != NO_BTN && beside_button(data, info->joy_idx, joykeys[i]))
+         ret |= (int16_t)(1 << i);
+   return ret;
+}
+static void beside_poll(void *data) { (void)data; }
+static const char *beside_name(void *data, unsigned pad)
+{
+   return pad == 0 ? "Beside Pad" : NULL;
+}
+static hid_driver_t beside_hid = {
+   beside_init, beside_query, beside_free, beside_button, beside_state,
+   beside_get_buttons, beside_axis, beside_poll, NULL, beside_name, "beside"
+};
+#endif
+
+/* A pad beside the joypad driver - one no joypad driver sees, as a
+ * DualShock 3 bound to WinUSB is - takes a device number from the
+ * shared pool, and while it has one the driver is reached through a
+ * stand-in that hands that number's reads to the source; the driver's
+ * own pads read as before. Without it the driver is reached directly. */
+static void lane_beside_source(void)
+{
+#ifdef HAVE_HID
+   input_driver_state_t *input_st     = input_state_get_ptr();
+   settings_t *settings               = config_get_ptr();
+   const input_device_driver_t *real  = input_st->primary_joypad;
+   struct retro_keybind *b_bind       = &input_autoconf_binds[15][RETRO_DEVICE_ID_JOYPAD_B];
+   struct retro_keybind saved_b       = *b_bind;
+   unsigned saved_index               = settings->uints.input_joypad_index[1];
+   unsigned had                       = failures;
+   int n;
+
+   if (!real || string_is_equal(real->ident, "hid"))
+   {
+      printf("[skip] beside source: no joypad driver, or it is HID's own\n");
+      return;
+   }
+   input_driver_beside_override(&beside_hid);
+   run_loop_frames(1);
+   CHECK(beside_init_number == 15,
+         "beside source: a pad found in its init did not get the top device"
+         " number");
+   input_driver_hid_release(&beside_buttons, 0);
+   run_loop_frames(1);
+   CHECK(input_st->primary_joypad == real,
+         "beside source: the driver is stood in for with no pad beside it");
+
+   n = input_driver_hid_claim(&beside_buttons, 0, "Beside Pad", 0x1234, 0x5678);
+   CHECK(n == 15, "beside source: its pad did not get the top device number");
+   CHECK(input_st->primary_joypad == real,
+         "beside source: the driver was stood in for before the next poll");
+   run_loop_frames(1);
+   CHECK(   input_st->primary_joypad != real
+         && string_is_equal(input_st->primary_joypad->ident, real->ident),
+         "beside source: the driver is not stood in for with a pad beside it");
+
+   /* port 2 on device 16 reads the source's pad, port 1 does not */
+   settings->uints.input_joypad_index[1] = 15;
+   b_bind->joykey                        = 0;
+   beside_buttons                        = 1;
+   run_loop_frames(1);
+   CHECK(input_driver_state_wrapper(1, RETRO_DEVICE_JOYPAD, 0,
+            RETRO_DEVICE_ID_JOYPAD_B),
+         "beside source: the pad's press does not reach its port");
+   CHECK(!input_driver_state_wrapper(0, RETRO_DEVICE_JOYPAD, 0,
+            RETRO_DEVICE_ID_JOYPAD_B),
+         "beside source: the pad's press reaches the driver's port");
+   beside_buttons = 0;
+   run_loop_frames(1);
+   CHECK(!input_driver_state_wrapper(1, RETRO_DEVICE_JOYPAD, 0,
+            RETRO_DEVICE_ID_JOYPAD_B),
+         "beside source: the pad's release does not reach its port");
+
+   /* gone: the driver is reached directly again */
+   input_driver_hid_release(&beside_buttons, 0);
+   run_loop_frames(1);
+   CHECK(input_st->primary_joypad == real,
+         "beside source: the driver is still stood in for with no pad beside it");
+
+   /* the driver's pad arriving on its number moves it */
+   CHECK(input_driver_hid_claim(&beside_buttons, 0, "Beside Pad", 0x1234,
+            0x5678) == 15, "beside source: the pad back did not get its number");
+   input_driver_registry_connect(15, real->ident, "Driver Pad", "", 1, 2);
+   CHECK(input_driver_hid_number(&beside_buttons, 0) == 14,
+         "beside source: the driver's pad on its number did not move it");
+   input_driver_registry_disconnect(15);
+   input_driver_hid_release(&beside_buttons, 0);
+   input_autoconfigure_disconnect(14, "Beside Pad");
+
+   settings->uints.input_joypad_index[1] = saved_index;
+   *b_bind = saved_b;
+   input_driver_beside_override(NULL);
+   run_loop_frames(2);
+   CHECK(input_st->primary_joypad == real,
+         "beside source: stopping the source left the driver stood in for");
+   if (failures == had)
+      printf("[pass] beside source: a pad beside the joypad driver takes a"
+            " pooled device number, its port reads it, the driver's ports"
+            " do not, and the driver is reached directly once it is gone\n");
+#else
+   printf("[skip] beside source: no HID\n");
+#endif
+}
 
 /* A button remapped onto another carries its pressure with it. */
 static void lane_remap_pressure(void)
@@ -6093,6 +6232,40 @@ static void lane_entries(void)
       CHECK(!hf_paused_now(), "entries: a timed entry let go early was given");
    }
 
+   /* --- how far in its buttons must be pushed, as the core reads them --- */
+   input_entries_clear();
+   CHECK(   input_entry_add(3, "start pressed 50% held 1s : pause")
+         && input_entry_spec(3, spec, sizeof(spec))
+         && !strcmp(spec, "start held 1s pressed 50% : pause"),
+         "entries: a depth with a time, either order, does not read back as one");
+   CHECK(   !input_entry_add(4, "start pressed 0% : pause")
+         && !input_entry_add(4, "start pressed 101% : pause")
+         && !input_entry_add(4, "start pressed 50 : pause")
+         && !input_entry_add(4, "start pressed 50% x : pause")
+         && !input_entry_add(4, " pressed 50% : pause"),
+         "entries: a depth that is not one was taken");
+   input_entries_clear();
+   CHECK(input_entry_add(1, "start pressed 80% : pause"), "entries: a depth is not read");
+   CHECK(input_entry_add(2, "key_g : unpause"),           "entries: the key's entry is not read again");
+   input_autoconf_bind_edit(0, START)->joyaxis = AXIS_POS(2);
+   en_hold(0, 3);
+   syn_axes[2] = 0x4000;   /* half way */
+   en_hold(b_start, 4);
+   CHECK(!hf_paused(), "entries: a button pushed half way set off one that wants 80%");
+   syn_axes[2] = 0x7400;   /* most of the way */
+   en_hold(b_start, 4);
+   CHECK(hf_paused(), "entries: a button pushed past its depth did not set it off");
+   en_hold(0, 3);
+   syn_axes[2] = 0;
+   os_tap();
+   CHECK(!hf_paused(), "entries: the key did not give its command");
+   /* a button with no reading of how far counts as all the way */
+   input_autoconf_bind_edit(0, START)->joyaxis = AXIS_NONE;
+   en_hold(b_start, 4);
+   CHECK(hf_paused(), "entries: a button with no depth reading did not set it off");
+   en_hold(0, 3);
+   os_tap();
+
    /* --- no more than there is room for --- */
    input_entries_clear();
    for (i = 1; i <= 16; i++)
@@ -7308,17 +7481,20 @@ static void lane_entry_target_pick(void)
       snprintf(why, sizeof(why), "target pick: picking Menu Toggle made \"%s\", not \"l3+r3 : menu_toggle\"", spec);
       CHECK(!strcmp(spec, "l3+r3 : menu_toggle"), why);
    }
-   /* then the response time's list: Instant, or held for a time */
+   /* then the response time's list: Instant, held for a time, or
+    * pushed in so far */
    run_loop_frames(2);
    CHECK(stack && stack->size == depth + 1 && stack->list[depth].label
          && !strcmp(stack->list[depth].label, msg_hash_to_str(MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST)),
          "target pick: after the target the response time's list is not up");
    {
       file_list_t *sel = MENU_LIST_GET_SELECTION(menu_state_get_ptr()->entries.list, 0);
-      CHECK(   sel && sel->size == 2 && sel->list[0].path && sel->list[1].path
+      CHECK(   sel && sel->size == 3 && sel->list[0].path && sel->list[1].path
+            && sel->list[2].path
             && !strcmp(sel->list[0].path, msg_hash_to_str(MSG_INPUT_COMBO_INSTANT))
-            && !strcmp(sel->list[1].path, msg_hash_to_str(MSG_INPUT_COMBO_HOLD_FOR)),
-            "target pick: the response time's list is not Instant and Hold For");
+            && !strcmp(sel->list[1].path, msg_hash_to_str(MSG_INPUT_COMBO_HOLD_FOR))
+            && !strcmp(sel->list[2].path, msg_hash_to_str(MSG_INPUT_COMBO_PRESS_DEPTH)),
+            "target pick: the response time's list is not Instant, Hold For and Press Depth");
       menu_state_get_ptr()->selection_ptr = 1;   /* Hold For */
       tp_press(ok_b);
    }
@@ -7366,6 +7542,37 @@ static void lane_entry_target_pick(void)
    input_entry_spec(5, spec, sizeof(spec));
    CHECK(!strcmp(spec, "l3+r3 held 2s : macro_2") && stack && stack->size == depth,
          "target pick: picking a macro for an entry did not keep its buttons and time and change what it does");
+
+   /* --- Press Depth: how far in, ten to a hundred percent; the time kept --- */
+   row5->actions->left(row5, 0, false);
+   run_loop_frames(3);
+   idx = tp_index("macro_2");
+   if (idx >= 0)
+   {
+      menu_state_get_ptr()->selection_ptr = (size_t)idx;
+      tp_press(ok_b);
+   }
+   run_loop_frames(2);
+   menu_state_get_ptr()->selection_ptr = 2;   /* Press Depth */
+   tp_press(ok_b);
+   run_loop_frames(2);
+   {
+      file_list_t *sel = MENU_LIST_GET_SELECTION(menu_state_get_ptr()->entries.list, 0);
+      CHECK(   stack && stack->size == depth + 1 && sel && sel->size == 10
+            && sel->list[0].path && strstr(sel->list[0].path, "10%")
+            && sel->list[9].path && strstr(sel->list[9].path, "100%"),
+            "target pick: after Press Depth the list of how far in is not up");
+      menu_state_get_ptr()->selection_ptr = 7;   /* 80% */
+      tp_press(ok_b);
+   }
+   spec[0] = '\0';
+   input_entry_spec(5, spec, sizeof(spec));
+   {
+      char why[200];
+      snprintf(why, sizeof(why), "target pick: 80%% picked made \"%s\"", spec);
+      CHECK(!strcmp(spec, "l3+r3 held 2s pressed 80% : macro_2")
+            && stack && stack->size == depth, why);
+   }
 
    /* --- Back out of the list makes nothing --- */
    {
@@ -7566,6 +7773,129 @@ static void lane_aim_stick(void)
 
 /* The sensor snapshot is made for a shader that reads sensors, and
  * for nobody else: with no such shader the poll publishes nothing. */
+/* The audio device across what does not change it: a core's new frame
+ * rate, base size or sample rate leaves it open, and a driver restart
+ * opens it once, menu sounds on. The null driver gets a device that
+ * counts, for the lane. */
+extern audio_driver_t audio_null;
+static unsigned avd_opens;
+static int      avd_token;
+static void *avd_init(const char *device, unsigned rate, unsigned latency,
+      unsigned *new_rate)
+{
+   (void)device; (void)latency;
+   *new_rate = rate;
+   avd_opens++;
+   return &avd_token;
+}
+static ssize_t avd_write(void *data, const void *buf, size_t len)
+{ (void)data; (void)buf; return (ssize_t)len; }
+static bool avd_true(void *data) { (void)data; return true; }
+static bool avd_start(void *data, bool shutdown)
+{ (void)data; (void)shutdown; return true; }
+static void avd_nonblock(void *data, bool state) { (void)data; (void)state; }
+static bool avd_float(void *data) { (void)data; return false; }
+static void avd_free(void *data) { (void)data; }
+
+static void lane_av_info_keeps_audio(void)
+{
+   settings_t *settings             = config_get_ptr();
+   video_driver_state_t *video_st   = video_state_get_ptr();
+   audio_driver_t saved             = audio_null;
+   struct retro_system_av_info orig = video_st->av_info;
+   struct retro_system_av_info info;
+   bool menu_sounds                 = settings->bools.audio_enable_menu;
+   unsigned had                     = failures;
+   unsigned opens;
+
+   audio_null.init               = avd_init;
+   audio_null.write              = avd_write;
+   audio_null.stop               = avd_true;
+   audio_null.start              = avd_start;
+   audio_null.alive              = avd_true;
+   audio_null.set_nonblock_state = avd_nonblock;
+   audio_null.free               = avd_free;
+   audio_null.use_float          = avd_float;
+   command_event(CMD_EVENT_AUDIO_REINIT, NULL);
+   run_frames(5);
+   CHECK(audio_state_get_ptr()->context_audio_data == &avd_token,
+         "av info: the counting device did not come up");
+
+   /* A new frame rate and base size, the maximum as it was. */
+   avd_opens = 0;
+   info = orig;
+   info.timing.fps           = orig.timing.fps / 2.0;
+   info.geometry.base_width  = orig.geometry.base_width  / 2;
+   info.geometry.base_height = orig.geometry.base_height / 2;
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+   run_frames(5);
+   opens = avd_opens;
+   CHECK(opens == 0 && video_st->av_info.timing.fps == info.timing.fps,
+         "av info: a new frame rate and base size reopened the audio device");
+
+   /* A new sample rate. */
+   info.timing.sample_rate   = orig.timing.sample_rate / 2.0;
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+   run_frames(5);
+   CHECK(avd_opens == opens,
+         "av info: a new sample rate reopened the audio device");
+
+   /* A driver restart, menu sounds on: one teardown, one open. */
+   settings->bools.audio_enable_menu = true;
+   avd_opens = 0;
+   command_event(CMD_EVENT_REINIT, NULL);
+   run_frames(5);
+   CHECK(avd_opens == 1,
+         "av info: a driver restart with menu sounds on opened the audio device more than once");
+   if (avd_opens != 1)
+      fprintf(stderr, "      opened %u times\n", avd_opens);
+
+   settings->bools.audio_enable_menu = menu_sounds;
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &orig);
+   audio_null = saved;
+   command_event(CMD_EVENT_AUDIO_REINIT, NULL);
+   run_frames(5);
+   if (failures == had)
+      printf("[pass] av info: a core's new frame rate, base size or sample"
+            " rate leaves the audio device open; a driver restart opens it"
+            " once, menu sounds on\n");
+}
+
+/* The frame limit across a core's new frame rate: the rate times the
+ * fast-forward ratio, at the new rate once it is set. */
+static void lane_av_info_frame_limit(void)
+{
+   settings_t *settings             = config_get_ptr();
+   runloop_state_t *runloop_st      = runloop_state_get_ptr();
+   video_driver_state_t *video_st   = video_state_get_ptr();
+   struct retro_system_av_info orig = video_st->av_info;
+   struct retro_system_av_info info;
+   float ratio                      = settings->floats.fastforward_ratio;
+   retro_time_t want;
+   unsigned had                     = failures;
+
+   settings->floats.fastforward_ratio = 2.0f;
+   command_event(CMD_EVENT_SET_FRAME_LIMIT, NULL);
+
+   info             = orig;
+   info.timing.fps  = orig.timing.fps / 2.0;
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+   want = (retro_time_t)roundf(1000000.0f / ((float)info.timing.fps * 2.0f));
+   CHECK(runloop_st->frame_limit_minimum_time == want,
+         "frame limit: a new frame rate left the limit at the old one");
+   if (runloop_st->frame_limit_minimum_time != want)
+      fprintf(stderr, "      %lld us, want %lld\n",
+            (long long)runloop_st->frame_limit_minimum_time, (long long)want);
+
+   settings->floats.fastforward_ratio = ratio;
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &orig);
+   command_event(CMD_EVENT_SET_FRAME_LIMIT, NULL);
+   run_frames(5);
+   if (failures == had)
+      printf("[pass] frame limit: a core's new frame rate sets the limit"
+            " from it\n");
+}
+
 static void lane_sensor_snapshot_idle(void)
 {
    input_driver_state_t *input_st = input_state_get_ptr();
@@ -8802,6 +9132,7 @@ int main(int argc, char *argv[])
       lane_input_rotation();
       lane_triggers();
       lane_remap_pressure();
+      lane_beside_source();
       lane_network_retropad();
       lane_pointer_capture();
       lane_menu_combo_gate();
@@ -8842,6 +9173,8 @@ int main(int argc, char *argv[])
       /* last: these restart the drivers */
       lane_input_kept();
       lane_joypad_reinit();
+      lane_av_info_keeps_audio();
+      lane_av_info_frame_limit();
    }
 
    lane_sensor_snapshot_idle();
