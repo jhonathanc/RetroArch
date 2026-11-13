@@ -173,12 +173,15 @@ static retro_time_t fake_last_flip_due;
  * queued after it has been shown, 0 from then on */
 static u32 fake_flip_status;
 static bool fake_flip_queued;
+static bool fake_poll_keeps_pending;
 static unsigned fake_flip_hangs;
 /* rsx_wait_flip spins on this; a pending flip is shown at its due
  * time, a reset with no flip behind it would spin forever */
 u32 gcmGetFlipStatus(void)
 {
    rsx_flip_waits++;
+   if (fake_poll_keeps_pending)
+      return fake_flip_status;
    if (fake_flip_status)
    {
       if (!fake_flip_queued)
@@ -253,8 +256,14 @@ rsxProgramAttrib *rsxFragmentProgramGetAttrib(const rsxFragmentProgram *fp,
 
 void rsxBindVertexArrayAttrib(gcmContextData *c, u8 attr, u16 frequency,
       u32 offset, u8 stride, u8 elems, u8 dtype, u8 location) { }
+static unsigned rsx_depth_clears;
+static unsigned rsx_color_clears;
 void rsxClearSurface(gcmContextData *c, u32 clear_mask)
 {
+   if (clear_mask & (GCM_CLEAR_Z | GCM_CLEAR_S))
+      rsx_depth_clears++;
+   if (clear_mask & (GCM_CLEAR_R | GCM_CLEAR_G | GCM_CLEAR_B | GCM_CLEAR_A))
+      rsx_color_clears++;
    if (fake_flip_period && fake_gpu_time < fake_flip_due)
       fake_clear_hazards++;
 }
@@ -1211,6 +1220,64 @@ static void test_widget_dupe_frame(void)
    printf("widget_dupe_frame: ok\n");
 }
 
+static void test_hw_depth_clears(void)
+{
+   static const float vertex[] = { 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1 };
+   static const float color[] = {
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+   };
+   static u8 pixels[4 * 4 * 2];
+   struct retro_rsx_image image;
+   video_frame_info_t info;
+   video_coords_t coords;
+   rsx_t *rsx;
+   rsx_font_t *font;
+   unsigned depth, colors;
+
+   memset(&info, 0, sizeof(info));
+   fake_hwr.context_type = RETRO_HW_CONTEXT_RSX;
+   rsx = driver_up();
+   image.offset = 0x10000;
+   image.pitch  = 512 * 4;
+   image.width  = 512;
+   image.height = 240;
+   rsx_set_hw_image(rsx, &image);
+   depth  = rsx_depth_clears;
+   colors = rsx_color_clears;
+   frame_out(rsx, RETRO_HW_FRAME_BUFFER_VALID, 0, 0, 0, NULL, &info);
+   CHECK(rsx_depth_clears == depth,
+         "hw_depth_clears: depth-disabled composition clears depth");
+   CHECK(rsx_color_clears == colors + 1,
+         "hw_depth_clears: composition must still clear its borders");
+
+   font = (rsx_font_t*)rsx_font_init(rsx, NULL, 12.0f, false);
+   CHECK(font != NULL, "hw_depth_clears: font initialization");
+   if (font)
+   {
+      memset(&coords, 0, sizeof(coords));
+      coords.vertices  = 6;
+      coords.vertex    = vertex;
+      coords.tex_coord = vertex;
+      coords.color     = color;
+      depth            = rsx_depth_clears;
+      rsx_font_draw_vertices(rsx, font, &coords);
+      CHECK(rsx_depth_clears == depth,
+            "hw_depth_clears: hardware-frame text clears unused depth");
+      rsx_font_free(font, false);
+   }
+   driver_down(rsx);
+
+   fake_hwr.context_type = RETRO_HW_CONTEXT_NONE;
+   rsx   = driver_up();
+   depth = rsx_depth_clears;
+   frame_out(rsx, pixels, VIDEO_SCALE_PACK(4, 4), 0, 8, NULL, &info);
+   CHECK(rsx_depth_clears > depth,
+         "hw_depth_clears: software composition changed");
+   driver_down(rsx);
+   printf("hw_depth_clears: ok\n");
+}
+
 static void test_widget_visibility(void)
 {
    struct retro_rsx_image image;
@@ -1511,6 +1578,104 @@ static void test_flip_latency(void)
       driver_down(rsx);
    }
    printf("flip_latency: ok\n");
+}
+
+static void test_duplicate_overlap(void)
+{
+   struct retro_rsx_image image;
+   struct texture_image update;
+   rsx_texture_t texture;
+   video_frame_info_t info;
+   rsx_t *rsx;
+   uint32_t pixel = 0, replacement = 0xff010203;
+   unsigned flips, hazards, overlaps;
+
+   memset(&info, 0, sizeof(info));
+   memset(&update, 0, sizeof(update));
+   memset(&texture, 0, sizeof(texture));
+   fake_hwr.context_type = RETRO_HW_CONTEXT_RSX;
+   rsx = driver_up();
+   image.offset = 0x10000;
+   image.pitch  = 512 * 4;
+   image.width  = 512;
+   image.height = 240;
+   rsx_set_hw_image(rsx, &image);
+   info.max_swapchain_images = 2;
+   info.widgets_active = fake_widgets_visible = true;
+   rsx_set_nonblock_state(rsx, false, false, 1);
+   fake_flip_period = 16667;
+   fake_gpu_time = fake_time = 10 * fake_flip_period;
+   fake_flip_pending();
+   flips    = rsx_flip_calls;
+   hazards  = fake_clear_hazards;
+   overlaps = fake_flip_overlap;
+
+   frame_out(rsx, NULL, 0, 1, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 1 && fake_flip_due > fake_time,
+         "duplicate_overlap: core duplicate did not release the next field");
+
+   texture.data = &pixel;
+   texture.tex.format = GCM_TEXTURE_FORMAT_A8R8G8B8 | GCM_TEXTURE_FORMAT_LIN;
+   texture.tex.width = texture.tex.height = 1;
+   texture.tex.pitch = 4;
+   update.pixels = &replacement;
+   update.width = update.height = 1;
+   fake_poll_keeps_pending = true;
+   CHECK(rsx_update_texture(rsx, (uintptr_t)&texture, &update, false)
+         == VIDEO_TEXTURE_UPDATE_DROPPED && !pixel,
+         "duplicate_overlap: an in-flight texture could be overwritten");
+   fake_poll_keeps_pending = false;
+
+   frame_out(rsx, NULL, 0, 2, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 2 && !fake_flip_due,
+         "duplicate_overlap: consecutive duplicates skipped both waits");
+   CHECK(rsx_update_texture(rsx, (uintptr_t)&texture, &update, false)
+         == VIDEO_TEXTURE_UPDATE_DONE && pixel == replacement,
+         "duplicate_overlap: texture remains blocked after flip completion");
+
+   info.frame_repeat = true;
+   frame_out(rsx, NULL, 0, 3, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 3 && !fake_flip_due,
+         "duplicate_overlap: frontend replay skipped its wait");
+   info.frame_repeat = false;
+   frame_out(rsx, NULL, 0, 4, 0, NULL, &info);
+   frame_out(rsx, RETRO_HW_FRAME_BUFFER_VALID, 0, 5, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 5 && !fake_flip_due,
+         "duplicate_overlap: a fresh frame skipped its wait");
+
+   rsx->overlay_enable = true;
+   frame_out(rsx, NULL, 0, 6, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 6 && !fake_flip_due,
+         "duplicate_overlap: an overlay frame skipped its wait");
+   rsx->overlay_enable = false;
+   info.menu_st_flags = MENU_ST_FLAG_ALIVE;
+   rsx->menu_frame_enable = true;
+   frame_out(rsx, NULL, 0, 7, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 7 && !fake_flip_due,
+         "duplicate_overlap: a menu frame skipped its wait");
+
+   info.menu_st_flags = 0;
+   rsx->menu_frame_enable = false;
+   info.widgets_active = fake_widgets_visible = false;
+   frame_out(rsx, NULL, 0, 8, 0, NULL, &info);
+   rsx_set_nonblock_state(rsx, true, false, 1);
+   frame_out(rsx, NULL, 0, 9, 0, NULL, &info);
+   CHECK(rsx_flip_calls == flips + 8 && fake_flip_due > fake_time,
+         "duplicate_overlap: a nonblocking bare duplicate added a flip");
+   pixel = 0;
+   fake_poll_keeps_pending = true;
+   CHECK(rsx_update_texture(rsx, (uintptr_t)&texture, &update, false)
+         == VIDEO_TEXTURE_UPDATE_DROPPED && !pixel,
+         "duplicate_overlap: switching off vsync lost texture protection");
+   fake_poll_keeps_pending = false;
+   CHECK(fake_clear_hazards == hazards && fake_flip_overlap == overlaps,
+         "duplicate_overlap: reused a display surface too early");
+
+   fake_flip_period = fake_flip_due = 0;
+   fake_widgets_visible = false;
+   driver_down(rsx);
+   fake_hwr.context_type = RETRO_HW_CONTEXT_NONE;
+   printf("duplicate_overlap: ok\n");
 }
 
 /* A dupe redraws the last frame that loaded, and with nothing loaded
@@ -1849,9 +2014,11 @@ int main(int argc, char **argv)
    } tests[] = {
       { "widget_dupe_frame", test_widget_dupe_frame },
       { "widget_visibility", test_widget_visibility },
+      { "hw_depth_clears", test_hw_depth_clears },
       { "ui_dupe_pacing", test_ui_dupe_pacing },
       { "bare_dupe_pacing", test_bare_dupe_pacing },
       { "flip_latency", test_flip_latency },
+      { "duplicate_overlap", test_duplicate_overlap },
       { "dupe_keeps_image", test_dupe_keeps_image },
       { "widget_layer_order", test_widget_layer_order },
       { "ui_cleanup", test_ui_cleanup },
