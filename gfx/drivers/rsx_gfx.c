@@ -223,6 +223,7 @@ typedef struct
    /* The last presented image carries frontend layers: a duped frame
     * without any is presented once more to take them off */
    bool ui_presented;
+   bool overlapped_dupe;
 } rsx_t;
 
 #include "../font_driver.h"
@@ -580,7 +581,8 @@ static void gfx_display_rsx_draw(gfx_display_ctx_draw_t *draw,
          rsx->fpo[RSX_SHADER_STOCK_BLEND], rsx->fp_offset[RSX_SHADER_STOCK_BLEND],
          GCM_LOCATION_RSX);
 
-   rsxClearSurface(rsx->context, GCM_CLEAR_Z);
+   if (!rsx->hw_render)
+      rsxClearSurface(rsx->context, GCM_CLEAR_Z);
    rsxInvalidateVertexCache(rsx->context);
    rsxDrawVertexArray(rsx->context, GCM_TYPE_TRIANGLE_STRIP, 0, draw->coords->vertices);
 }
@@ -934,7 +936,8 @@ static void rsx_font_draw_vertices(
          font->proj_matrix, (float *)&rsx->mvp_no_rot);
    rsxLoadFragmentProgramLocation(rsx->context, font->fpo,
          font->fp_offset, GCM_LOCATION_RSX);
-   rsxClearSurface(rsx->context, GCM_CLEAR_Z);
+   if (!rsx->hw_render)
+      rsxClearSurface(rsx->context, GCM_CLEAR_Z);
 
    while (remaining)
    {
@@ -1956,15 +1959,19 @@ static uintptr_t rsx_texture_unload_wrap(void *data)
 #endif
 
 /* Written in place like the menu texture */
-static void rsx_update_texture_internal(rsx_texture_t *texture,
-      const struct texture_image *ti)
+static enum video_texture_update rsx_update_texture_internal(rsx_t *rsx,
+      rsx_texture_t *texture, const struct texture_image *ti)
 {
+   if (rsx && rsx->overlapped_dupe && gcmGetFlipStatus() != 0)
+      return VIDEO_TEXTURE_UPDATE_DROPPED;
    memcpy(texture->data, ti->pixels, ti->height * ti->width * 4);
+   return VIDEO_TEXTURE_UPDATE_DONE;
 }
 
 #ifdef HAVE_THREADS
 typedef struct
 {
+   rsx_t *rsx;
    rsx_texture_t *texture;
    const struct texture_image *ti;
 } rsx_update_cmd_t;
@@ -1972,8 +1979,7 @@ typedef struct
 static uintptr_t rsx_texture_update_wrap(void *data)
 {
    rsx_update_cmd_t *cmd = (rsx_update_cmd_t*)data;
-   rsx_update_texture_internal(cmd->texture, cmd->ti);
-   return 1;
+   return rsx_update_texture_internal(cmd->rsx, cmd->texture, cmd->ti);
 }
 #endif
 
@@ -1995,15 +2001,15 @@ static enum video_texture_update rsx_update_texture(void *video_data,
    if (threaded)
    {
       rsx_update_cmd_t cmd;
+      cmd.rsx     = (rsx_t*)video_data;
       cmd.texture = texture;
       cmd.ti      = ti;
-      video_thread_texture_handle(&cmd, rsx_texture_update_wrap);
-      return VIDEO_TEXTURE_UPDATE_DONE;
+      return (enum video_texture_update)video_thread_texture_handle(
+            &cmd, rsx_texture_update_wrap);
    }
 #endif
 
-   rsx_update_texture_internal(texture, ti);
-   return VIDEO_TEXTURE_UPDATE_DONE;
+   return rsx_update_texture_internal((rsx_t*)video_data, texture, ti);
 }
 
 static uintptr_t rsx_load_texture(void *video_data, void *data,
@@ -2226,8 +2232,7 @@ static void rsx_clear_surface(rsx_t* rsx)
                   | GCM_CLEAR_G
                   | GCM_CLEAR_B
                   | GCM_CLEAR_A
-                  | GCM_CLEAR_S
-                  | GCM_CLEAR_Z);
+                  | (rsx->hw_render ? 0 : GCM_CLEAR_S | GCM_CLEAR_Z));
    rsxSetZMinMaxControl(rsx->context, 0, 1, 1);
 }
 
@@ -2294,7 +2299,8 @@ static void rsx_draw_vertices(rsx_t* rsx)
    rsxSetVertexProgramParameter(rsx->context, rsx->vpo[RSX_SHADER_MENU], rsx->proj_matrix[RSX_SHADER_MENU], (float *)&rsx->mvp);
    rsxLoadFragmentProgramLocation(rsx->context, rsx->fpo[RSX_SHADER_MENU], rsx->fp_offset[RSX_SHADER_MENU], GCM_LOCATION_RSX);
 
-   rsxClearSurface(rsx->context, GCM_CLEAR_Z);
+   if (!rsx->hw_render)
+      rsxClearSurface(rsx->context, GCM_CLEAR_Z);
    rsxDrawVertexArray(rsx->context, GCM_TYPE_TRIANGLE_STRIP, 0, 4);
 }
 
@@ -2366,7 +2372,8 @@ static void rsx_draw_menu_vertices(rsx_t* rsx)
    rsxSetBlendFunc(rsx->context, GCM_SRC_ALPHA, GCM_ONE_MINUS_SRC_ALPHA, GCM_SRC_ALPHA, GCM_ONE_MINUS_SRC_ALPHA);
    rsxSetBlendEquation(rsx->context, GCM_FUNC_ADD, GCM_FUNC_ADD);
 
-   rsxClearSurface(rsx->context, GCM_CLEAR_Z);
+   if (!rsx->hw_render)
+      rsxClearSurface(rsx->context, GCM_CLEAR_Z);
    rsxDrawVertexArray(rsx->context, GCM_TYPE_TRIANGLE_STRIP, 0, 4);
 
    rsxSetBlendEnable(rsx->context, GCM_FALSE);
@@ -2397,7 +2404,8 @@ static void rsx_draw_overlay_vertices(rsx_t* rsx, unsigned image)
    rsxSetBlendFunc(rsx->context, GCM_SRC_ALPHA, GCM_ONE_MINUS_SRC_ALPHA, GCM_SRC_ALPHA, GCM_ONE_MINUS_SRC_ALPHA);
    rsxSetBlendEquation(rsx->context, GCM_FUNC_ADD, GCM_FUNC_ADD);
 
-   rsxClearSurface(rsx->context, GCM_CLEAR_Z);
+   if (!rsx->hw_render)
+      rsxClearSurface(rsx->context, GCM_CLEAR_Z);
    rsxDrawVertexArray(rsx->context, GCM_TYPE_TRIANGLE_STRIP, 0, 4);
 
    rsxSetBlendEnable(rsx->context, GCM_FALSE);
@@ -2723,6 +2731,11 @@ static bool rsx_frame(void* data, const void* frame,
          ;
    /* Two images keep the core behind the flip: lowest input latency */
    bool overlap                     = video_info->max_swapchain_images > 2;
+   /* Give the next core field time to render after one duplicate. */
+   bool overlap_dupe                = video_info->max_swapchain_images == 2
+         && !sync_ui && !gcm->overlapped_dupe
+         && !frame && !video_info->frame_repeat
+         && gcm->hw_render && gcm->hw_image_valid;
    /* The core shares the FIFO and leaves its own state behind. */
    bool restore                     = gcm->hw_render && (frame || draw_cached);
 
@@ -2732,7 +2745,10 @@ static bool rsx_frame(void* data, const void* frame,
    if (frame || draw_cached)
    {
       if (gcm->vsync)
+      {
          rsx_wait_flip();
+         gcm->overlapped_dupe = false;
+      }
       gcmSetWaitFlip(gcm->context);
    }
    if (restore)
@@ -2883,7 +2899,12 @@ static bool rsx_frame(void* data, const void* frame,
       rsx_update_screen(gcm);
       /* Menu and overlay uploads happen between frame calls. */
       if (gcm->vsync && (sync_ui || !overlap))
-         rsx_wait_flip();
+      {
+         if (overlap_dupe)
+            gcm->overlapped_dupe = true;
+         else
+            rsx_wait_flip();
+      }
       gcm->ui_presented = ui_now;
    }
    gcm->vert_idx         = 0;
